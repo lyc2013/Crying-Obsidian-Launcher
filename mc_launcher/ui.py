@@ -61,7 +61,18 @@ from .settings import (
     load_settings,
     save_settings,
 )
-from .version import VersionError, list_versions, loader_label
+from .version import (
+    CATEGORY_APRIL_FOOLS,
+    CATEGORY_LABELS,
+    CATEGORY_OLD,
+    CATEGORY_RELEASE,
+    CATEGORY_SNAPSHOT,
+    VersionError,
+    instance_version_info,
+    list_versions,
+    loader_label,
+    version_category,
+)
 
 TAB_LAUNCH = 0
 TAB_INSTANCES = 1
@@ -248,8 +259,7 @@ class VersionListWorker(QThread):
         except VersionError as exc:
             self.failed.emit(str(exc))
             return
-        releases = [item["id"] for item in versions if item.get("type") == "release"]
-        self.versions_ready.emit(releases)
+        self.versions_ready.emit(versions)
 
 
 class MainWindow(QMainWindow):
@@ -375,6 +385,12 @@ class MainWindow(QMainWindow):
         self.inst_loader_label = QLabel("—")
         form.addRow("加载器", self.inst_loader_label)
 
+        self.inst_base_version_label = QLabel("—")
+        form.addRow("实际版本", self.inst_base_version_label)
+
+        self.inst_category_label = QLabel("—")
+        form.addRow("分类", self.inst_category_label)
+
         dir_row = QHBoxLayout()
         self.inst_dir_edit = QLineEdit()
         self.inst_dir_edit.editingFinished.connect(self._reload_instance_versions)
@@ -440,10 +456,28 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
+        self.download_top_tabs = QTabWidget()
+
+        # ---- 原版游戏：四个分类的子标签 ----
+        vanilla = QWidget()
+        vanilla_layout = QVBoxLayout(vanilla)
+        vanilla_layout.setContentsMargins(0, 0, 0, 0)
+        vanilla_layout.setSpacing(8)
+
         top = QHBoxLayout()
-        self.download_list = QListWidget()
-        self.download_list.currentItemChanged.connect(self._download_selected)
-        top.addWidget(self.download_list, 1)
+        self.download_sub_tabs = QTabWidget()
+        self.download_lists: dict[str, QListWidget] = {}
+        for category_key in (
+            CATEGORY_RELEASE,
+            CATEGORY_SNAPSHOT,
+            CATEGORY_OLD,
+            CATEGORY_APRIL_FOOLS,
+        ):
+            lst = QListWidget()
+            lst.currentItemChanged.connect(self._download_selected)
+            self.download_sub_tabs.addTab(lst, CATEGORY_LABELS[category_key])
+            self.download_lists[category_key] = lst
+        top.addWidget(self.download_sub_tabs, 1)
 
         side = QVBoxLayout()
         self.download_refresh_button = QPushButton("刷新版本列表")
@@ -454,7 +488,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.download_count_label)
         side.addStretch(1)
         top.addLayout(side)
-        layout.addLayout(top, 1)
+        vanilla_layout.addLayout(top, 1)
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -469,20 +503,36 @@ class MainWindow(QMainWindow):
         self.download_dir_button.clicked.connect(self._browse_download_dir)
         dir_row.addWidget(self.download_dir_button)
         form.addRow("游戏目录", dir_row)
-        layout.addLayout(form)
+        vanilla_layout.addLayout(form)
 
         self.download_button = QPushButton("下载并创建实例")
         self.download_button.clicked.connect(self._download)
-        layout.addWidget(self.download_button)
+        vanilla_layout.addWidget(self.download_button)
 
         self.download_progress = QProgressBar()
         self.download_progress.setRange(0, 1)
         self.download_progress.setValue(0)
-        layout.addWidget(self.download_progress)
+        vanilla_layout.addWidget(self.download_progress)
 
         self.download_status = QLabel("就绪")
         self.download_status.setWordWrap(True)
-        layout.addWidget(self.download_status)
+        vanilla_layout.addWidget(self.download_status)
+
+        self.download_top_tabs.addTab(vanilla, "原版游戏")
+
+        # ---- 资源下载：占位 ----
+        resources = QWidget()
+        res_layout = QVBoxLayout(resources)
+        res_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        res_label = QLabel("暂不支持，敬请期待。")
+        res_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        res_font = res_label.font()
+        res_font.setPointSize(18)
+        res_label.setFont(res_font)
+        res_layout.addWidget(res_label)
+        self.download_top_tabs.addTab(resources, "资源下载")
+
+        layout.addWidget(self.download_top_tabs, 1)
         return page
 
     def _build_accounts_page(self) -> QWidget:
@@ -821,18 +871,23 @@ class MainWindow(QMainWindow):
 
             for instance in children:
                 suffix = "  [默认]" if instance.id == self.settings.default_instance_id else ""
-                loader = loader_label(
-                    instance.version, Path(instance.game_dir).expanduser()
+                game_dir_path = Path(instance.game_dir).expanduser()
+                loader = loader_label(instance.version, game_dir_path)
+                base_version, category = instance_version_info(
+                    instance.version, game_dir_path
                 )
-                if instance.name == instance.version:
-                    text = f"{instance.name}  ·  {loader}{suffix}"
-                else:
-                    text = f"{instance.name}  ·  {instance.version}  ·  {loader}{suffix}"
+                text = (
+                    f"{instance.name}  ·  {base_version}  ·  {category}  "
+                    f"·  {loader}{suffix}"
+                )
                 child = QTreeWidgetItem([text])
                 child.setData(0, Qt.ItemDataRole.UserRole, ("instance", instance.id))
                 child.setToolTip(
                     0,
-                    f"{instance.name}\n版本 {instance.version}\n加载器 {loader}\n{instance.game_dir}",
+                    (
+                        f"{instance.name}\n实际版本 {base_version}\n分类 {category}\n"
+                        f"加载器 {loader}\n{instance.game_dir}"
+                    ),
                 )
                 root.addChild(child)
             root.setExpanded(True)
@@ -892,10 +947,12 @@ class MainWindow(QMainWindow):
         account = self.settings.default_account
         if instance:
             extra = "（独立内存）" if instance.max_memory else "（全局内存）"
-            loader = loader_label(
-                instance.version, Path(instance.game_dir).expanduser()
+            game_dir_path = Path(instance.game_dir).expanduser()
+            loader = loader_label(instance.version, game_dir_path)
+            base_version, category = instance_version_info(instance.version, game_dir_path)
+            base = (
+                f"默认实例：{instance.name}（{base_version} · {category} · {loader}）{extra}"
             )
-            base = f"默认实例：{instance.name}（{instance.version} · {loader}）{extra}"
         else:
             base = "尚未添加实例，请到「版本管理」或「下载」页面添加"
         account_text = f"账号：{account}" if account else "账号：未设置"
@@ -950,6 +1007,8 @@ class MainWindow(QMainWindow):
         self.inst_min_spin.setValue(self.settings.min_memory)
         self.inst_args_edit.clear()
         self.inst_loader_label.setText("—")
+        self.inst_base_version_label.setText("—")
+        self.inst_category_label.setText("—")
         self.inst_isolation_label.setText(hint)
 
     def _set_instance_buttons_enabled(self, enabled: bool) -> None:
@@ -993,10 +1052,14 @@ class MainWindow(QMainWindow):
         directory = self.inst_dir_edit.text().strip()
         if not version or not directory:
             self.inst_loader_label.setText("—")
+            self.inst_base_version_label.setText("—")
+            self.inst_category_label.setText("—")
             return
-        self.inst_loader_label.setText(
-            loader_label(version, Path(directory).expanduser())
-        )
+        game_dir = Path(directory).expanduser()
+        self.inst_loader_label.setText(loader_label(version, game_dir))
+        base_version, category = instance_version_info(version, game_dir)
+        self.inst_base_version_label.setText(base_version)
+        self.inst_category_label.setText(category)
 
     def _update_instance_isolation_label(self, instance: Instance) -> None:
         game_dir = self.settings.game_dir_for_instance(instance)
@@ -1237,8 +1300,13 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- downloads
 
+    def _current_download_list(self) -> QListWidget | None:
+        widget = self.download_sub_tabs.currentWidget()
+        return widget if isinstance(widget, QListWidget) else None
+
     def _download_selected(self, *_args) -> None:
-        item = self.download_list.currentItem()
+        lst = self._current_download_list()
+        item = lst.currentItem() if lst is not None else None
         if item is None:
             return
         version = item.text()
@@ -1259,7 +1327,8 @@ class MainWindow(QMainWindow):
             self.download_status.setText("正在取消安装，已下载的文件会保留…")
             return
 
-        item = self.download_list.currentItem()
+        lst = self._current_download_list()
+        item = lst.currentItem() if lst is not None else None
         if item is None:
             QMessageBox.warning(self, "未选择版本", "请先在列表中选择要下载的版本")
             return
@@ -1375,13 +1444,36 @@ class MainWindow(QMainWindow):
         self._version_worker = worker
         worker.start()
 
-    def _online_versions_ready(self, releases: list[str]) -> None:
+    def _online_versions_ready(self, versions: list[dict]) -> None:
         self.download_refresh_button.setEnabled(True)
-        self.download_list.clear()
-        self.download_list.addItems(releases)
-        self.download_count_label.setText(f"共 {len(releases)} 个正式版")
-        if releases:
-            self.download_list.setCurrentRow(0)
+        categorized: dict[str, list[str]] = {key: [] for key in CATEGORY_LABELS}
+        for entry in versions:
+            category = version_category(entry.get("type", ""), entry.get("id", ""))
+            categorized.setdefault(category, []).append(entry.get("id", ""))
+
+        total = 0
+        for category, ids in categorized.items():
+            ids.sort(
+                key=lambda name: (tuple(int(p) for p in re.findall(r"\d+", name)), name),
+                reverse=True,
+            )
+            self.download_lists[category].clear()
+            self.download_lists[category].addItems(ids)
+            total += len(ids)
+
+        self.download_count_label.setText(f"共 {total} 个版本")
+
+        for category in (
+            CATEGORY_RELEASE,
+            CATEGORY_SNAPSHOT,
+            CATEGORY_APRIL_FOOLS,
+            CATEGORY_OLD,
+        ):
+            lst = self.download_lists[category]
+            if lst.count():
+                self.download_sub_tabs.setCurrentWidget(lst)
+                lst.setCurrentRow(0)
+                break
 
     def _online_versions_failed(self, message: str) -> None:
         self.download_refresh_button.setEnabled(True)

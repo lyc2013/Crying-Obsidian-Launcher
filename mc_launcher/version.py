@@ -172,6 +172,69 @@ def load_version_json(
     return fetch_version_json(version_id, refresh=refresh)
 
 
+CATEGORY_RELEASE = "release"
+CATEGORY_SNAPSHOT = "snapshot"
+CATEGORY_OLD = "old"
+CATEGORY_APRIL_FOOLS = "april_fools"
+
+CATEGORY_LABELS: dict[str, str] = {
+    CATEGORY_RELEASE: "正式版",
+    CATEGORY_SNAPSHOT: "预览版",
+    CATEGORY_OLD: "远古版",
+    CATEGORY_APRIL_FOOLS: "愚人节版",
+}
+
+# Standard dev snapshot: 24w05a ; pre-release / release candidate: 1.20.5-pre1
+_SNAPSHOT_RE = re.compile(r"^\d{2}w\d{2}[a-z]$")
+_PRERELEASE_RE = re.compile(r"^\d+\.\d+(\.\d+)?-(pre|rc)\d+$")
+
+
+def version_category(version_type: str, version_id: str) -> str:
+    """Classify a Mojang version into one of the four launcher categories."""
+    version_type = (version_type or "").lower()
+    if version_type == "release":
+        return CATEGORY_RELEASE
+    if version_type in ("old_alpha", "old_beta"):
+        return CATEGORY_OLD
+    if version_type == "snapshot":
+        if _SNAPSHOT_RE.match(version_id) or _PRERELEASE_RE.match(version_id):
+            return CATEGORY_SNAPSHOT
+        return CATEGORY_APRIL_FOOLS
+    return CATEGORY_APRIL_FOOLS
+
+
+def base_version_id(version_id: str, game_dir: str | Path) -> str | None:
+    """Return the vanilla base version id of an installed (possibly modded) version."""
+    chain = inheritance_chain(version_id, game_dir)
+    if not chain:
+        return None
+    return chain[-1].get("id")
+
+
+def instance_category_label(version_id: str, game_dir: str | Path) -> str:
+    """Return the category label for an installed instance, based on its base version."""
+    base = base_version_id(version_id, game_dir)
+    if base is None:
+        return "未知"
+    try:
+        manifest = fetch_manifest()
+    except VersionError:
+        return "未知"
+    entry = next(
+        (item for item in manifest.get("versions", []) if item.get("id") == base), None
+    )
+    if entry is None:
+        return "未知"
+    return CATEGORY_LABELS.get(version_category(entry.get("type", ""), base), "未知")
+
+
+def instance_version_info(version_id: str, game_dir: str | Path) -> tuple[str, str]:
+    """Return (base_version_id, category_label) for an installed instance."""
+    base = base_version_id(version_id, game_dir) or version_id
+    category = instance_category_label(version_id, game_dir)
+    return base, category
+
+
 _LOADER_LIBRARIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Fabric", ("net.fabricmc:fabric-loader",)),
     ("Quilt", ("org.quiltmc:quilt-loader",)),

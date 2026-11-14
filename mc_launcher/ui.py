@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -49,11 +51,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import loaders
 from .auth import AuthError, offline_account
 from .config import APP_NAME, GAME_DIR
 from .install import install_version, is_file_status
 from .java import JavaError, JavaInstallation, detect_java, inspect_java
 from .launch import LaunchError, build_launch_spec, run_game
+from .resources.mapper import version_key
 from .mirror import (
     abort_downloads,
     enable_mirror,
@@ -328,6 +332,259 @@ class VersionListWorker(QThread):
         self.versions_ready.emit(versions)
 
 
+class LoaderVersionsWorker(QThread):
+    ready = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, loader_id: str, mc_version: str) -> None:
+        super().__init__()
+        self._loader_id = loader_id
+        self._mc_version = mc_version
+
+    def run(self) -> None:
+        try:
+            if self._mc_version:
+                versions = loaders.loader_versions(self._loader_id, self._mc_version)
+            else:
+                versions = loaders.supported_minecraft_versions(self._loader_id)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the dialog
+            self.failed.emit(str(exc))
+            return
+        self.ready.emit(versions)
+
+
+class LoaderInstallWorker(QThread):
+    status_changed = Signal(str)
+    progress_changed = Signal(int, int)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(
+        self,
+        loader_id: str,
+        mc_version: str,
+        game_dir: Path,
+        loader_version: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._loader_id = loader_id
+        self._mc_version = mc_version
+        self._game_dir = game_dir
+        self._loader_version = loader_version
+        self._cancel = threading.Event()
+        self._maximum = 0
+
+    def run(self) -> None:
+        def callback() -> dict[str, object]:
+            return {
+                "setStatus": self.status_changed.emit,
+                "setProgress": lambda value: self.progress_changed.emit(
+                    int(value), self._maximum
+                ),
+                "setMax": self._on_max,
+            }
+
+        try:
+            version_id = loaders.install_loader(
+                self._loader_id,
+                self._mc_version,
+                self._game_dir,
+                loader_version=self._loader_version,
+                callback=callback(),
+                cancel=self._cancel,
+            )
+        except loaders.LoaderInstallCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(version_id)
+
+    def _on_max(self, value: int) -> None:
+        self._maximum = max(0, int(value))
+        self.progress_changed.emit(0, self._maximum)
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+
+class LoaderInstallDialog(QDialog):
+    """Pick a loader + version for one MC version and install it with progress."""
+
+    def __init__(
+        self,
+        parent,
+        mc_version: str,
+        game_dir: Path,
+        current_loader: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("安装加载器")
+        self.resize(480, 320)
+        self.mc_version = mc_version
+        self.game_dir = game_dir
+        self.installed_version_id: str | None = None
+        self._worker: LoaderInstallWorker | None = None
+        self._versions_worker: LoaderVersionsWorker | None = None
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.addRow("Minecraft 版本", QLabel(mc_version))
+
+        self.loader_combo = QComboBox()
+        for key, label in loaders.LOADERS:
+            self.loader_combo.addItem(label, key)
+        if current_loader:
+            index = self.loader_combo.findData(current_loader)
+            if index >= 0:
+                self.loader_combo.setCurrentIndex(index)
+        form.addRow("加载器", self.loader_combo)
+
+        self.version_combo = QComboBox()
+        form.addRow("加载器版本", self.version_combo)
+        layout.addLayout(form)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setStyleSheet("color: palette(mid);")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(500)
+        layout.addWidget(self.log, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.install_button = QPushButton("安装")
+        self.install_button.clicked.connect(self._install)
+        buttons.addWidget(self.install_button)
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+        self.loader_combo.currentIndexChanged.connect(self._load_versions)
+        self._load_versions()
+
+    def _load_versions(self) -> None:
+        loader_id = self.loader_combo.currentData()
+        if not loader_id:
+            return
+        self.version_combo.clear()
+        self.version_combo.addItem("正在获取版本…", None)
+        self.version_combo.setEnabled(False)
+        installed = loaders.installed_loader_version(loader_id, self.mc_version, self.game_dir)
+        if installed:
+            self.hint_label.setText(f"该版本已安装 {loader_id}：{installed}（可为其他实例重新安装）")
+        else:
+            self.hint_label.setText("正在读取可用加载器版本…")
+        worker = LoaderVersionsWorker(loader_id, self.mc_version)
+        worker.ready.connect(self._versions_ready)
+        worker.failed.connect(self._versions_failed)
+        self._versions_worker = worker
+        worker.start()
+
+    def _versions_ready(self, versions: list[str]) -> None:
+        self.version_combo.clear()
+        if not versions:
+            self.version_combo.addItem("该游戏版本没有可用加载器版本", None)
+            self.version_combo.setEnabled(False)
+            self.install_button.setEnabled(False)
+            self.hint_label.setText("该加载器未发布此 Minecraft 版本。")
+            return
+        for index, version in enumerate(versions):
+            label = version
+            if index == 0:
+                label += "  （最新 / 推荐）"
+            self.version_combo.addItem(label, version)
+        self.version_combo.setCurrentIndex(0)
+        self.version_combo.setEnabled(True)
+        self.install_button.setEnabled(True)
+        self.hint_label.setText(f"共 {len(versions)} 个可用版本，默认选择最新推荐版。")
+
+    def _versions_failed(self, message: str) -> None:
+        self.version_combo.clear()
+        self.version_combo.addItem("加载失败", None)
+        self.version_combo.setEnabled(False)
+        self.install_button.setEnabled(False)
+        self.hint_label.setText(f"版本列表获取失败：{message}")
+
+    def _install(self) -> None:
+        loader_version = self.version_combo.currentData()
+        loader_id = self.loader_combo.currentData()
+        if not loader_id or not loader_version:
+            return
+        self.install_button.setEnabled(False)
+        self.loader_combo.setEnabled(False)
+        self.version_combo.setEnabled(False)
+        self.close_button.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self.log.clear()
+        self._append(f"开始安装 {loader_id} {loader_version}（MC {self.mc_version}）")
+
+        worker = LoaderInstallWorker(
+            loader_id, self.mc_version, self.game_dir, loader_version
+        )
+        worker.status_changed.connect(self._append)
+        worker.progress_changed.connect(self._on_progress)
+        worker.finished_ok.connect(self._installed)
+        worker.failed.connect(self._install_failed)
+        worker.cancelled.connect(self._install_cancelled)
+        self._worker = worker
+        worker.start()
+
+    def _append(self, text: str) -> None:
+        self.log.appendPlainText(text)
+
+    def _on_progress(self, value: int, maximum: int) -> None:
+        if maximum > 0:
+            self.progress.setRange(0, maximum)
+            self.progress.setValue(value)
+
+    def _installed(self, version_id: str) -> None:
+        self.installed_version_id = version_id
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self._append(f"安装完成：{version_id}")
+        self.close_button.setEnabled(True)
+        self.close_button.setText("完成")
+        self.accept()
+
+    def _install_failed(self, message: str) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._append(f"安装失败：{message}")
+        self._reset_controls()
+
+    def _install_cancelled(self) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._append("已取消安装")
+        self._reset_controls()
+
+    def _reset_controls(self) -> None:
+        self.install_button.setEnabled(True)
+        self.loader_combo.setEnabled(True)
+        self.version_combo.setEnabled(True)
+        self.close_button.setEnabled(True)
+
+    def reject(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(1500)
+        if self._versions_worker is not None and self._versions_worker.isRunning():
+            self._versions_worker.wait(3000)
+        super().reject()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -347,6 +604,10 @@ class MainWindow(QMainWindow):
         self._version_worker: VersionListWorker | None = None
         self._java_installations: list[JavaInstallation] = []
         self._pending_download: tuple[str, Path] | None = None
+        self._pending_loader: str | None = None
+        self._loader_worker: LoaderInstallWorker | None = None
+        self._download_loader_versions: set[str] | None = None
+        self._download_loader_worker: LoaderVersionsWorker | None = None
         self._install_version = ""
         self._launching = False
         self._install_seconds = 0
@@ -549,6 +810,9 @@ class MainWindow(QMainWindow):
         self.inst_launch_button = QPushButton("启动此实例")
         self.inst_launch_button.clicked.connect(self._launch_selected_instance)
         right_actions.addWidget(self.inst_launch_button)
+        self.inst_loader_button = QPushButton("安装加载器…")
+        self.inst_loader_button.clicked.connect(self._open_loader_dialog)
+        right_actions.addWidget(self.inst_loader_button)
         self.inst_delete_button = QPushButton("删除实例")
         self.inst_delete_button.clicked.connect(self._delete_instance)
         right_actions.addWidget(self.inst_delete_button)
@@ -618,6 +882,22 @@ class MainWindow(QMainWindow):
         top.addLayout(side)
         vanilla_layout.addLayout(top, 1)
 
+        loader_row = QHBoxLayout()
+        loader_row.setSpacing(8)
+        loader_row.addWidget(QLabel("加载器"))
+        self.download_loader_combo = QComboBox()
+        self.download_loader_combo.addItem("原版（无加载器）", "")
+        for key, label in loaders.LOADERS:
+            self.download_loader_combo.addItem(label, key)
+        self.download_loader_combo.currentIndexChanged.connect(
+            self._on_download_loader_changed
+        )
+        loader_row.addWidget(self.download_loader_combo, 1)
+        self.download_loader_hint = QLabel("选择加载器后只显示其支持的游戏版本")
+        self.download_loader_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        loader_row.addWidget(self.download_loader_hint, 2)
+        vanilla_layout.addLayout(loader_row)
+
         form = QFormLayout()
         form.setSpacing(8)
         self.download_name_edit = QLineEdit()
@@ -648,17 +928,12 @@ class MainWindow(QMainWindow):
 
         self.download_top_tabs.addTab(vanilla, "原版游戏")
 
-        # ---- 资源下载：占位 ----
-        resources = QWidget()
-        res_layout = QVBoxLayout(resources)
-        res_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        res_label = QLabel("暂不支持，敬请期待。")
-        res_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        res_font = res_label.font()
-        res_font.setPointSize(18)
-        res_label.setFont(res_font)
-        res_layout.addWidget(res_label)
-        self.download_top_tabs.addTab(resources, "资源下载")
+        # ---- 资源下载：模组 / 整合包 / 光影 / 资源包 / 数据包 ----
+        from .resources.browser import ResourceBrowser
+
+        self.resource_browser = ResourceBrowser(lambda: self.settings)
+        self.resource_browser.instances_changed.connect(self._refresh_all)
+        self.download_top_tabs.addTab(self.resource_browser, "资源下载")
 
         layout.addWidget(self.download_top_tabs, 1)
         return page
@@ -737,6 +1012,47 @@ class MainWindow(QMainWindow):
         self.mirror_combo.addItem("BMCLAPI 镜像（国内推荐）", "bmclapi")
         mirror_layout.addWidget(self.mirror_combo)
         layout.addWidget(mirror_box)
+
+        resource_box = QGroupBox("资源下载")
+        resource_form = QFormLayout(resource_box)
+
+        self.resource_source_combo = QComboBox()
+        self.resource_source_combo.addItem("Modrinth（MCIM 镜像）", "modrinth")
+        self.resource_source_combo.addItem("Modrinth 官方", "modrinth_official")
+        self.resource_source_combo.addItem("CurseForge（MCIM 镜像）", "curseforge")
+        resource_form.addRow("下载源", self.resource_source_combo)
+
+        self.curseforge_key_edit = QLineEdit()
+        self.curseforge_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.curseforge_key_edit.setPlaceholderText("可留空；填写后优先使用官方 API")
+        resource_form.addRow("CurseForge API Key", self.curseforge_key_edit)
+
+        self.resource_concurrency_spin = QSpinBox()
+        self.resource_concurrency_spin.setRange(1, 6)
+        self.resource_concurrency_spin.setSuffix(" 个")
+        resource_form.addRow("请求并发数", self.resource_concurrency_spin)
+
+        self.resource_page_mode_combo = QComboBox()
+        self.resource_page_mode_combo.addItem("底部分页器", "pagination")
+        self.resource_page_mode_combo.addItem("滚动到底自动加载", "scroll")
+        resource_form.addRow("分页模式", self.resource_page_mode_combo)
+
+        self.resource_chinese_check = QCheckBox("优先展示中文简介（镜像提供翻译时）")
+        resource_form.addRow("", self.resource_chinese_check)
+
+        resource_dir_row = QHBoxLayout()
+        self.resource_dir_edit = QLineEdit()
+        self.resource_dir_edit.setPlaceholderText("留空则使用默认实例的游戏目录")
+        resource_dir_row.addWidget(self.resource_dir_edit, 1)
+        self.resource_dir_button = QPushButton("选择…")
+        self.resource_dir_button.clicked.connect(self._browse_resource_dir)
+        resource_dir_row.addWidget(self.resource_dir_button)
+        resource_form.addRow("下载目录", resource_dir_row)
+
+        self.resource_proxy_edit = QLineEdit()
+        self.resource_proxy_edit.setPlaceholderText("例如 http://127.0.0.1:7890，留空表示不使用代理")
+        resource_form.addRow("代理", self.resource_proxy_edit)
+        layout.addWidget(resource_box)
 
         isolation_box = QGroupBox("实例隔离")
         isolation_layout = QVBoxLayout(isolation_box)
@@ -834,6 +1150,16 @@ class MainWindow(QMainWindow):
         self.show_log_check.setChecked(self.settings.show_log)
         self.isolation_check.setChecked(self.settings.instance_isolation)
         self.launch_log.setVisible(self.settings.show_log)
+
+        index = self.resource_source_combo.findData(self.settings.resource_source)
+        self.resource_source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.curseforge_key_edit.setText(self.settings.curseforge_api_key)
+        self.resource_concurrency_spin.setValue(self.settings.resource_concurrency)
+        index = self.resource_page_mode_combo.findData(self.settings.resource_page_mode)
+        self.resource_page_mode_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.resource_chinese_check.setChecked(self.settings.resource_prefer_chinese)
+        self.resource_dir_edit.setText(self.settings.resource_download_dir or "")
+        self.resource_proxy_edit.setText(self.settings.resource_proxy)
         self._refresh_game_dir_widgets()
 
     def _refresh_game_dir_widgets(self, select_id: str | None = None) -> None:
@@ -1144,6 +1470,7 @@ class MainWindow(QMainWindow):
             self.inst_save_button,
             self.inst_default_button,
             self.inst_launch_button,
+            self.inst_loader_button,
             self.inst_delete_button,
         ):
             button.setEnabled(enabled)
@@ -1188,6 +1515,36 @@ class MainWindow(QMainWindow):
         base_version, category = instance_version_info(version, game_dir)
         self.inst_base_version_label.setText(base_version)
         self.inst_category_label.setText(category)
+
+    def _open_loader_dialog(self) -> None:
+        instance = self._selected_instance()
+        if instance is None:
+            QMessageBox.warning(self, "未选择实例", "请先在左侧选择一个实例")
+            return
+        record = self.settings.game_dir_for_instance(instance)
+        if self.settings.get_effective_isolation(record.id):
+            game_dir = self.settings.effective_game_root(instance)
+        else:
+            game_dir = Path(instance.game_dir).expanduser()
+        base_version, _category = instance_version_info(
+            instance.version, Path(instance.game_dir).expanduser()
+        )
+        mc_version = base_version if base_version and base_version != "—" else instance.version
+        current_label = loader_label(instance.version, game_dir)
+        current_loader = loaders.LOADER_IDS.get(current_label)
+
+        dialog = LoaderInstallDialog(self, mc_version, game_dir, current_loader)
+        if (
+            dialog.exec() == QDialog.DialogCode.Accepted
+            and dialog.installed_version_id
+        ):
+            instance.version = dialog.installed_version_id
+            self._persist()
+            self._refresh_instance_list(select_id=instance.id)
+            self._refresh_launch_info()
+            self.download_status.setText(
+                f"实例「{instance.name}」已切换为 {dialog.installed_version_id}"
+            )
 
     def _update_instance_isolation_label(self, instance: Instance) -> None:
         game_dir = self.settings.game_dir_for_instance(instance)
@@ -1437,21 +1794,89 @@ class MainWindow(QMainWindow):
     def _apply_snapshot_filter(self, *_args) -> None:
         if self.snapshot_filter is None:
             return
-        wanted = self.snapshot_filter.currentData() or ""
-        lst = self.download_lists.get("预览版")
-        if lst is None:
+        self._apply_download_filters()
+
+    def _on_download_loader_changed(self) -> None:
+        loader_id = self.download_loader_combo.currentData() or ""
+        self._download_loader_versions = None
+        if not loader_id:
+            self.download_loader_hint.setText("原版模式：显示全部官方版本")
+            self._apply_download_filters()
             return
-        for row in range(lst.count()):
-            item = lst.item(row)
-            category = item.data(Qt.ItemDataRole.UserRole)
-            item.setHidden(bool(wanted) and category != wanted)
+        self.download_loader_hint.setText("正在获取该加载器支持的游戏版本…")
+        worker = LoaderVersionsWorker(loader_id, "")
+        worker.ready.connect(
+            lambda versions: self._loader_versions_ready(loader_id, versions)
+        )
+        worker.failed.connect(
+            lambda message: self.download_loader_hint.setText(
+                f"加载器版本获取失败：{message}"
+            )
+        )
+        self._download_loader_worker = worker
+        worker.start()
+
+    def _loader_versions_ready(self, loader_id: str, versions: list[str]) -> None:
+        if (self.download_loader_combo.currentData() or "") != loader_id:
+            return
+        self._download_loader_versions = set(versions)
+        self.download_loader_hint.setText(
+            f"{self.download_loader_combo.currentText()} 支持 {len(versions)} 个游戏版本"
+        )
+        self._apply_download_filters()
+
+    def _apply_download_filters(self) -> None:
+        wanted = self.snapshot_filter.currentData() if self.snapshot_filter else ""
+        allowed = self._download_loader_versions
+        for group, lst in self.download_lists.items():
+            visible_without_loader: list[QListWidgetItem] = []
+            for row in range(lst.count()):
+                item = lst.item(row)
+                base = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
+                category = item.data(Qt.ItemDataRole.UserRole)
+                visible = not wanted or category == wanted
+                if allowed is not None and base not in allowed:
+                    visible = False
+                item.setHidden(not visible)
+                if visible and group == "正式版":
+                    visible_without_loader.append(item)
+
+            # 标记最新 / 推荐（加载器模式下）
+            if allowed is not None and visible_without_loader:
+                bases = [
+                    entry.data(Qt.ItemDataRole.UserRole + 1) or entry.text()
+                    for entry in visible_without_loader
+                ]
+                newest = max(bases, key=version_key)
+                stable = [
+                    name
+                    for name in bases
+                    if not re.search(r"(?:snapshot|pre|rc)", name, re.IGNORECASE)
+                ]
+                recommended = max(stable, key=version_key) if stable else newest
+                for entry in visible_without_loader:
+                    base = entry.data(Qt.ItemDataRole.UserRole + 1) or entry.text()
+                    if base == newest == recommended:
+                        entry.setText(f"{base}  ·  推荐 / 最新")
+                    elif base == newest:
+                        entry.setText(f"{base}  ·  最新")
+                    elif base == recommended:
+                        entry.setText(f"{base}  ·  推荐")
+                    else:
+                        entry.setText(base)
+            else:
+                for entry in visible_without_loader:
+                    base = entry.data(Qt.ItemDataRole.UserRole + 1)
+                    if base:
+                        entry.setText(base)
+
 
     def _download_selected(self, *_args) -> None:
         lst = self._current_download_list()
         item = lst.currentItem() if lst is not None else None
         if item is None:
             return
-        version = item.text()
+        version = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
         self.download_name_edit.setText(version)
 
     def _browse_download_dir(self) -> None:
@@ -1461,7 +1886,21 @@ class MainWindow(QMainWindow):
         if directory:
             self.download_dir_edit.setText(directory)
 
+    def _browse_resource_dir(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择资源下载目录", self.resource_dir_edit.text() or str(GAME_DIR)
+        )
+        if directory:
+            self.resource_dir_edit.setText(directory)
+
     def _download(self) -> None:
+        if self._loader_worker is not None and self._loader_worker.isRunning():
+            self._loader_worker.cancel()
+            self.download_button.setEnabled(False)
+            self.download_button.setText("正在取消…")
+            self.download_status.setText("正在取消加载器安装…")
+            return
+
         if self._install_worker is not None and self._install_worker.isRunning():
             abort_downloads()
             self.download_button.setEnabled(False)
@@ -1475,12 +1914,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未选择版本", "请先在列表中选择要下载的版本")
             return
 
-        version = item.text()
+        version = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
         name = self.download_name_edit.text().strip() or version
         directory = Path(self.download_dir_edit.text().strip() or str(GAME_DIR)).expanduser()
 
         self._install_version = version
         self._pending_download = (name, directory)
+        self._pending_loader = self.download_loader_combo.currentData() or None
         self._set_install_running(True)
         self.download_status.setText(f"正在安装 {version} 到 {directory}…")
         self.download_progress.setRange(0, 0)
@@ -1507,22 +1947,55 @@ class MainWindow(QMainWindow):
 
     def _install_done(self, result) -> None:
         reset_downloads()
-        self._set_install_running(False)
+        self._refresh_process_panel()
         pending = self._pending_download
+        loader_id = self._pending_loader
+        self._pending_loader = None
+        if loader_id and pending is not None:
+            self._run_loader_after_install(loader_id, result.version, pending, result)
+            return
+        self._set_install_running(False)
         self._pending_download = None
         self._install_version = ""
+        self._create_instance_after_install(result.version, pending, result)
+
+    def _run_loader_after_install(
+        self, loader_id: str, mc_version: str, pending, result
+    ) -> None:
+        name, directory = pending
+        label = loaders.LOADER_LABELS.get(loader_id, loader_id)
+        self.download_status.setText(f"原版已安装，正在安装 {label}…")
+        self.download_progress.setRange(0, 0)
+        worker = LoaderInstallWorker(loader_id, mc_version, directory)
+        worker.status_changed.connect(self._install_status)
+        worker.progress_changed.connect(self._install_progress)
+        worker.failed.connect(self._install_failed)
+        worker.cancelled.connect(lambda: self._install_failed("安装已取消"))
+        worker.finished_ok.connect(
+            lambda version_id: self._loader_after_install_done(version_id, pending, result)
+        )
+        self._loader_worker = worker
+        worker.start()
         self._refresh_process_panel()
 
+    def _loader_after_install_done(self, version_id: str, pending, result) -> None:
+        self._loader_worker = None
+        self._set_install_running(False)
+        self._pending_download = None
+        self._install_version = ""
+        self._create_instance_after_install(version_id, pending, result)
+
+    def _create_instance_after_install(self, version_id: str, pending, result) -> None:
         instance = None
         if pending is not None:
             name, directory = pending
-            instance = self.settings.add_instance(name, result.version, directory)
+            instance = self.settings.add_instance(name, version_id, directory)
             self._persist()
 
         java_text = str(result.java_executable) if result.java_executable else "跳过（使用已有 Java）"
-        self.download_status.setText(f"安装完成：{result.version}")
+        self.download_status.setText(f"安装完成：{version_id}")
         self._append_launch_log(
-            f"[install] {result.version} 完成，client.jar 与 assets 已校验；JRE：{java_text}"
+            f"[install] {version_id} 完成，client.jar 与 assets 已校验；JRE：{java_text}"
         )
 
         self._refresh_instance_list(select_id=instance.id if instance else None)
@@ -1530,12 +2003,14 @@ class MainWindow(QMainWindow):
         self._refresh_launch_info()
         if instance is not None:
             QMessageBox.information(
-                self, "安装完成", f"已创建实例「{instance.name}」（{result.version}）"
+                self, "安装完成", f"已创建实例「{instance.name}」（{version_id}）"
             )
             self.tabs.setCurrentIndex(TAB_INSTANCES)
 
     def _install_failed(self, message: str) -> None:
         self._pending_download = None
+        self._pending_loader = None
+        self._loader_worker = None
         self._install_version = ""
         reset_downloads()
         self._set_install_running(False)
@@ -1627,6 +2102,7 @@ class MainWindow(QMainWindow):
             for version_id, category in entries:
                 item = QListWidgetItem(version_id)
                 item.setData(Qt.ItemDataRole.UserRole, category)
+                item.setData(Qt.ItemDataRole.UserRole + 1, version_id)
                 item.setToolTip(CATEGORY_LABELS.get(category, category))
                 lst.addItem(item)
             total += len(entries)
@@ -1732,9 +2208,21 @@ class MainWindow(QMainWindow):
         self.settings.instance_isolation = self.isolation_check.isChecked()
         self.settings.default_java = self.default_java_combo.currentData()
         self.settings.mirror = self.mirror_combo.currentData() or "mojang"
+        self.settings.resource_source = self.resource_source_combo.currentData() or "modrinth"
+        self.settings.curseforge_api_key = self.curseforge_key_edit.text().strip()
+        self.settings.resource_concurrency = self.resource_concurrency_spin.value()
+        self.settings.resource_page_mode = (
+            self.resource_page_mode_combo.currentData() or "pagination"
+        )
+        self.settings.resource_prefer_chinese = self.resource_chinese_check.isChecked()
+        directory = self.resource_dir_edit.text().strip()
+        self.settings.resource_download_dir = directory or None
+        self.settings.resource_proxy = self.resource_proxy_edit.text().strip()
         set_mirror(self.settings.mirror)
         enable_mirror()
         self._persist()
+        if hasattr(self, "resource_browser"):
+            self.resource_browser.apply_settings()
 
         self.launch_log.setVisible(self.settings.show_log)
         self.setWindowTitle(f"{APP_NAME}  ·  镜像 {mirror_name()}")
@@ -1977,6 +2465,8 @@ class MainWindow(QMainWindow):
         if self._launch_worker is not None and self._launch_worker.isRunning():
             self._launch_worker.stop()
             self._launch_worker.wait(3000)
+        if hasattr(self, "resource_browser"):
+            self.resource_browser.shutdown()
         self._process_timer.stop()
         event.accept()
 

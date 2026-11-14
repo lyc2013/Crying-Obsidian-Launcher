@@ -119,6 +119,14 @@ class Settings:
     min_memory: int = DEFAULT_MIN_MEMORY
     show_log: bool = False
     instance_isolation: bool = True
+    resource_source: str = "modrinth"
+    curseforge_api_key: str = ""
+    resource_concurrency: int = 6
+    resource_page_mode: str = "pagination"
+    resource_page_size: int = 20
+    resource_prefer_chinese: bool = True
+    resource_download_dir: str | None = None
+    resource_proxy: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +142,14 @@ class Settings:
             "min_memory": self.min_memory,
             "show_log": self.show_log,
             "instanceIsolation": self.instance_isolation,
+            "resource_source": self.resource_source,
+            "curseforge_api_key": self.curseforge_api_key,
+            "resource_concurrency": self.resource_concurrency,
+            "resource_page_mode": self.resource_page_mode,
+            "resource_page_size": self.resource_page_size,
+            "resource_prefer_chinese": self.resource_prefer_chinese,
+            "resource_download_dir": self.resource_download_dir,
+            "resource_proxy": self.resource_proxy,
         }
 
     @classmethod
@@ -175,6 +191,27 @@ class Settings:
             min_memory=int_or(DEFAULT_MIN_MEMORY, "min_memory"),
             show_log=bool(data.get("show_log", False)),
             instance_isolation=bool(data.get("instanceIsolation", True)),
+            resource_source=(
+                str(data.get("resource_source") or "modrinth")
+                if str(data.get("resource_source") or "modrinth")
+                in ("curseforge", "modrinth", "modrinth_official")
+                else "modrinth"
+            ),
+            curseforge_api_key=str(data.get("curseforge_api_key") or ""),
+            resource_concurrency=min(max(int_or(6, "resource_concurrency"), 1), 6),
+            resource_page_mode=(
+                "scroll" if data.get("resource_page_mode") == "scroll" else "pagination"
+            ),
+            resource_page_size=(
+                int(data.get("resource_page_size"))
+                if data.get("resource_page_size") in (20, 40, 60)
+                else 20
+            ),
+            resource_prefer_chinese=bool(data.get("resource_prefer_chinese", True)),
+            resource_download_dir=(
+                str(data["resource_download_dir"]) if data.get("resource_download_dir") else None
+            ),
+            resource_proxy=str(data.get("resource_proxy") or ""),
         )
         settings.sync_game_dirs()
         settings.resolve_defaults()

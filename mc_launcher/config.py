@@ -23,7 +23,9 @@ VERSIONS_META_DIR = META_DIR / "versions"
 GAME_DIR = Path(os.environ.get("MC_GAME_DIR", get_minecraft_directory())).expanduser()
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+BMCLAPI_MANIFEST_URL = "https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json"
 MANIFEST_TTL_SECONDS = 60 * 60
+MANIFEST_TIMEOUT_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 30
 USER_AGENT = f"{APP_NAME}/{__version__}"
 

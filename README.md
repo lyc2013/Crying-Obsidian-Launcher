@@ -64,7 +64,7 @@ macOS / Linux：
 .venv/bin/python -m mc_launcher gui
 ```
 
-国内网络可以在界面「设置」页把下载源切换为 BMCLAPI，无需额外配置。
+默认优先使用 BMCLAPI 镜像（国内网络更快），失败时自动回退 Mojang 官方源；也可以在界面「设置」页切换。
 
 命令行：
 
@@ -72,6 +72,7 @@ macOS / Linux：
 python -m mc_launcher versions              # 查看版本列表
 python -m mc_launcher info 1.20.1           # 查看版本元数据
 python -m mc_launcher install 1.20.1        # 下载安装
+python -m mc_launcher repair                # 重新扫描本地版本，修复并打印分类错分清单
 python -m mc_launcher login Steve           # 生成离线账号信息（UUID）
 python -m mc_launcher java                  # 列出本机 Java
 python -m mc_launcher java --mc-version 1.20.1   # 查看会选用哪个 Java
@@ -88,9 +89,9 @@ python -m mc_launcher gui                   # 打开图形界面
 
 | 页面 | 作用 |
 | --- | --- |
-| 启动 | 显示默认实例和默认账号，一个「启动游戏」按钮 |
+| 启动 | 显示默认实例和默认账号，一个启动/结束游戏按钮；右上角进程小窗显示游戏进程、下载/安装、版本列表等任务，点击展开详情 |
 | 版本管理 | 左侧按游戏目录分组显示实例（显示实际版本、分类、加载器）；右侧编辑名称、版本、加载器、实际版本、分类、Java、内存、附加参数、隔离方式；支持设为默认、启动此实例、删除 |
-| 下载 | 「原版游戏」按正式版/预览版/远古版/愚人节版分类列出版本，选择后下载并创建实例；「资源下载」暂未开放 |
+| 下载 | 「原版游戏」按正式版/预览版/远古版/愚人节版分类列出版本，预览版内可再筛选快照/预发布/候选；分类规则固定，官方源与 BMCLAPI 结果一致；「资源下载」暂未开放 |
 | 账号管理 | 添加/删除多个离线账号，设置默认账号 |
 | 设置 | Java 列表与手动添加、镜像源切换、全局内存、实例隔离开关、日志显示开关 |
 

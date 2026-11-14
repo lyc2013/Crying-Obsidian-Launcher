@@ -7,10 +7,16 @@ import os
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QFont
+try:
+    import psutil
+except ImportError:  # 可选依赖，只用来显示进程内存占用
+    psutil = None
+
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QFont, QPaintEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -32,6 +38,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStyle,
+    QStyleOptionTab,
+    QStylePainter,
+    QTabBar,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -62,16 +72,17 @@ from .settings import (
     save_settings,
 )
 from .version import (
-    CATEGORY_APRIL_FOOLS,
     CATEGORY_LABELS,
-    CATEGORY_OLD,
-    CATEGORY_RELEASE,
+    CATEGORY_PRERELEASE,
+    CATEGORY_RELEASE_CANDIDATE,
     CATEGORY_SNAPSHOT,
+    DOWNLOAD_GROUPS,
     VersionError,
+    classify_version,
+    download_group,
     instance_version_info,
     list_versions,
     loader_label,
-    version_category,
 )
 
 TAB_LAUNCH = 0
@@ -82,6 +93,59 @@ TAB_SETTINGS = 4
 
 MEMORY_MIN = 256
 MEMORY_MAX = 32768
+
+
+def nested_tab_position(depth: int) -> QTabWidget.TabPosition:
+    """Tag pages alternate: 1 层在上，2 层在左，3 层在上，4 层在左，以此类推。"""
+    return QTabWidget.TabPosition.North if depth % 2 else QTabWidget.TabPosition.West
+
+
+class SideTabBar(QTabBar):
+    """左侧标签栏：文字保持正向，放不下就按字换行竖排。"""
+
+    def _lines(self, index: int) -> list[str]:
+        text = self.tabText(index)
+        return [char for char in text] or [""]
+
+    def tabSizeHint(self, index: int) -> QSize:
+        metrics = self.fontMetrics()
+        lines = self._lines(index)
+        width = max(metrics.horizontalAdvance(line) for line in lines) + 22
+        height = metrics.lineSpacing() * len(lines) + 16
+        return QSize(width, height)
+
+    def minimumTabSizeHint(self, index: int) -> QSize:
+        return self.tabSizeHint(index)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QStylePainter(self)
+        option = QStyleOptionTab()
+        for index in range(self.count()):
+            self.initStyleOption(option, index)
+            rect = option.rect
+            selected = bool(option.state & QStyle.StateFlag.State_Selected)
+            painter.drawControl(QStyle.ControlElement.CE_TabBarTabShape, option)
+
+            font = self.font()
+            font.setBold(selected)
+            painter.save()
+            painter.setFont(font)
+            painter.setPen(self.palette().color(QPalette.ColorRole.WindowText))
+            metrics = painter.fontMetrics()
+            lines = self._lines(index)
+            total = metrics.lineSpacing() * len(lines)
+            y = rect.top() + (rect.height() - total) // 2
+            for line in lines:
+                painter.drawText(
+                    rect.left(),
+                    y,
+                    rect.width(),
+                    metrics.lineSpacing(),
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    line,
+                )
+                y += metrics.lineSpacing()
+            painter.restore()
 
 
 def installed_versions(game_dir: Path) -> list[str]:
@@ -184,6 +248,7 @@ class _QtPrinter:
 class LaunchWorker(QThread):
     log_line = Signal(str)
     status_changed = Signal(str)
+    process_started = Signal(object)
     finished_ok = Signal(int)
     failed = Signal(str)
 
@@ -239,6 +304,7 @@ class LaunchWorker(QThread):
 
     def _register_process(self, process) -> None:
         self._process = process
+        self.process_started.emit(process)
         if self._stop_requested:
             process.terminate()
 
@@ -281,11 +347,20 @@ class MainWindow(QMainWindow):
         self._version_worker: VersionListWorker | None = None
         self._java_installations: list[JavaInstallation] = []
         self._pending_download: tuple[str, Path] | None = None
+        self._install_version = ""
         self._launching = False
         self._install_seconds = 0
         self._install_timer = QTimer(self)
         self._install_timer.setInterval(1000)
         self._install_timer.timeout.connect(self._tick_install_timer)
+
+        self._game_process = None
+        self._game_started_at = 0.0
+        self._process_expanded = False
+        self._process_status = "未运行"
+        self._process_timer = QTimer(self)
+        self._process_timer.setInterval(1000)
+        self._process_timer.timeout.connect(self._refresh_process_panel)
 
         self._ensure_first_instance()
         self.setWindowTitle(f"{APP_NAME}  ·  镜像 {mirror_name()}")
@@ -300,6 +375,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
+        self.tabs.setTabPosition(nested_tab_position(1))
         self.setCentralWidget(self.tabs)
 
         self.tabs.addTab(self._build_launch_page(), "启动")
@@ -308,11 +384,43 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_accounts_page(), "账号管理")
         self.tabs.addTab(self._build_settings_page(), "设置")
 
+    def _build_process_bar(self) -> QHBoxLayout:
+        """启动页右上角的进程小窗。"""
+        row = QHBoxLayout()
+        row.addStretch(1)
+
+        self.process_frame = QFrame()
+        self.process_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.process_frame.setMaximumWidth(460)
+        process_layout = QVBoxLayout(self.process_frame)
+        process_layout.setContentsMargins(8, 4, 8, 4)
+        process_layout.setSpacing(2)
+
+        self.process_header = QPushButton("▸ 进程 · 空闲")
+        self.process_header.setFlat(True)
+        self.process_header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.process_header.setStyleSheet("text-align: left;")
+        self.process_header.clicked.connect(self._toggle_process_details)
+        process_layout.addWidget(self.process_header)
+
+        self.process_details = QLabel("")
+        self.process_details.setWordWrap(True)
+        self.process_details.setTextFormat(Qt.TextFormat.RichText)
+        self.process_details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.process_details.setVisible(False)
+        process_layout.addWidget(self.process_details)
+
+        row.addWidget(self.process_frame)
+        return row
+
     def _build_launch_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(40, 30, 40, 24)
         layout.setSpacing(14)
+        layout.addLayout(self._build_process_bar())
 
         self.launch_button = QPushButton("启动游戏")
         self.launch_button.setMinimumHeight(96)
@@ -457,6 +565,9 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.download_top_tabs = QTabWidget()
+        # 第 2 层（页面内层）标签放在左侧，文字不旋转、按字换行
+        self.download_top_tabs.setTabBar(SideTabBar())
+        self.download_top_tabs.setTabPosition(nested_tab_position(2))
 
         # ---- 原版游戏：四个分类的子标签 ----
         vanilla = QWidget()
@@ -466,17 +577,34 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         self.download_sub_tabs = QTabWidget()
+        # 第 3 层（再内层）标签回到上方
+        self.download_sub_tabs.setTabPosition(nested_tab_position(3))
         self.download_lists: dict[str, QListWidget] = {}
-        for category_key in (
-            CATEGORY_RELEASE,
-            CATEGORY_SNAPSHOT,
-            CATEGORY_OLD,
-            CATEGORY_APRIL_FOOLS,
-        ):
+        self.snapshot_filter: QComboBox | None = None
+        for group_label, _categories in DOWNLOAD_GROUPS:
+            group_page = QWidget()
+            group_layout = QVBoxLayout(group_page)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(6)
+
+            if group_label == "预览版":
+                self.snapshot_filter = QComboBox()
+                self.snapshot_filter.addItem("全部", "")
+                self.snapshot_filter.addItem("快照 Snapshot", CATEGORY_SNAPSHOT)
+                self.snapshot_filter.addItem("预发布 PreRelease", CATEGORY_PRERELEASE)
+                self.snapshot_filter.addItem(
+                    "候选 ReleaseCandidate", CATEGORY_RELEASE_CANDIDATE
+                )
+                self.snapshot_filter.currentIndexChanged.connect(
+                    self._apply_snapshot_filter
+                )
+                group_layout.addWidget(self.snapshot_filter)
+
             lst = QListWidget()
             lst.currentItemChanged.connect(self._download_selected)
-            self.download_sub_tabs.addTab(lst, CATEGORY_LABELS[category_key])
-            self.download_lists[category_key] = lst
+            group_layout.addWidget(lst, 1)
+            self.download_sub_tabs.addTab(group_page, group_label)
+            self.download_lists[group_label] = lst
         top.addWidget(self.download_sub_tabs, 1)
 
         side = QVBoxLayout()
@@ -1301,8 +1429,22 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- downloads
 
     def _current_download_list(self) -> QListWidget | None:
-        widget = self.download_sub_tabs.currentWidget()
-        return widget if isinstance(widget, QListWidget) else None
+        index = self.download_sub_tabs.currentIndex()
+        if index < 0:
+            return None
+        return self.download_lists.get(self.download_sub_tabs.tabText(index))
+
+    def _apply_snapshot_filter(self, *_args) -> None:
+        if self.snapshot_filter is None:
+            return
+        wanted = self.snapshot_filter.currentData() or ""
+        lst = self.download_lists.get("预览版")
+        if lst is None:
+            return
+        for row in range(lst.count()):
+            item = lst.item(row)
+            category = item.data(Qt.ItemDataRole.UserRole)
+            item.setHidden(bool(wanted) and category != wanted)
 
     def _download_selected(self, *_args) -> None:
         lst = self._current_download_list()
@@ -1337,10 +1479,12 @@ class MainWindow(QMainWindow):
         name = self.download_name_edit.text().strip() or version
         directory = Path(self.download_dir_edit.text().strip() or str(GAME_DIR)).expanduser()
 
+        self._install_version = version
         self._pending_download = (name, directory)
         self._set_install_running(True)
         self.download_status.setText(f"正在安装 {version} 到 {directory}…")
         self.download_progress.setRange(0, 0)
+        self._refresh_process_panel()
 
         worker = InstallWorker(
             version, directory, self.settings.default_java, self.settings.java_paths
@@ -1351,6 +1495,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._install_failed)
         self._install_worker = worker
         worker.start()
+        self._refresh_process_panel()
 
     def _install_status(self, text: str) -> None:
         self.download_status.setText(text)
@@ -1365,6 +1510,8 @@ class MainWindow(QMainWindow):
         self._set_install_running(False)
         pending = self._pending_download
         self._pending_download = None
+        self._install_version = ""
+        self._refresh_process_panel()
 
         instance = None
         if pending is not None:
@@ -1389,8 +1536,10 @@ class MainWindow(QMainWindow):
 
     def _install_failed(self, message: str) -> None:
         self._pending_download = None
+        self._install_version = ""
         reset_downloads()
         self._set_install_running(False)
+        self._refresh_process_panel()
         if message == "安装已取消":
             self.download_status.setText("已取消安装（已下载的文件会保留，可再次点击继续）")
             self._append_launch_log("[install] 用户取消了安装")
@@ -1428,6 +1577,7 @@ class MainWindow(QMainWindow):
     def _tick_install_timer(self) -> None:
         self._install_seconds += 1
         self.download_progress.setFormat(f"已用 {self._install_seconds} 秒  %p%")
+        self._refresh_process_panel()
 
     def _reset_progress(self) -> None:
         self.download_progress.setRange(0, 1)
@@ -1443,35 +1593,51 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._online_versions_failed)
         self._version_worker = worker
         worker.start()
+        self._refresh_process_panel()
 
     def _online_versions_ready(self, versions: list[dict]) -> None:
         self.download_refresh_button.setEnabled(True)
-        categorized: dict[str, list[str]] = {key: [] for key in CATEGORY_LABELS}
+        self._refresh_process_panel()
+
+        grouped: dict[str, list[tuple[str, str]]] = {
+            label: [] for label, _categories in DOWNLOAD_GROUPS
+        }
         for entry in versions:
-            category = version_category(entry.get("type", ""), entry.get("id", ""))
-            categorized.setdefault(category, []).append(entry.get("id", ""))
+            version_id = str(entry.get("id", ""))
+            if not version_id:
+                continue
+            category = classify_version(version_id, entry.get("type"))
+            group = download_group(category)
+            if group is None:
+                self._append_launch_log(f"[warn] 无法分类的版本：{version_id}（{category}）")
+                continue
+            grouped[group].append((version_id, category))
 
         total = 0
-        for category, ids in categorized.items():
-            ids.sort(
-                key=lambda name: (tuple(int(p) for p in re.findall(r"\d+", name)), name),
+        for group, entries in grouped.items():
+            entries.sort(
+                key=lambda pair: (
+                    tuple(int(part) for part in re.findall(r"\d+", pair[0])),
+                    pair[0],
+                ),
                 reverse=True,
             )
-            self.download_lists[category].clear()
-            self.download_lists[category].addItems(ids)
-            total += len(ids)
+            lst = self.download_lists[group]
+            lst.clear()
+            for version_id, category in entries:
+                item = QListWidgetItem(version_id)
+                item.setData(Qt.ItemDataRole.UserRole, category)
+                item.setToolTip(CATEGORY_LABELS.get(category, category))
+                lst.addItem(item)
+            total += len(entries)
 
+        self._apply_snapshot_filter()
         self.download_count_label.setText(f"共 {total} 个版本")
 
-        for category in (
-            CATEGORY_RELEASE,
-            CATEGORY_SNAPSHOT,
-            CATEGORY_APRIL_FOOLS,
-            CATEGORY_OLD,
-        ):
-            lst = self.download_lists[category]
+        for index, (group, _categories) in enumerate(DOWNLOAD_GROUPS):
+            lst = self.download_lists[group]
             if lst.count():
-                self.download_sub_tabs.setCurrentWidget(lst)
+                self.download_sub_tabs.setCurrentIndex(index)
                 lst.setCurrentRow(0)
                 break
 
@@ -1479,6 +1645,7 @@ class MainWindow(QMainWindow):
         self.download_refresh_button.setEnabled(True)
         self.download_count_label.setText("版本列表获取失败，可点「刷新版本列表」重试")
         self._append_launch_log(f"[error] {message}")
+        self._refresh_process_panel()
 
     # --------------------------------------------------------------- accounts
 
@@ -1657,15 +1824,20 @@ class MainWindow(QMainWindow):
         )
         worker.log_line.connect(self._append_launch_log)
         worker.status_changed.connect(self.launch_status.setText)
+        worker.process_started.connect(self._game_process_started)
         worker.finished_ok.connect(self._launch_done)
         worker.failed.connect(self._launch_failed)
         self._launch_worker = worker
         self._set_launching(True)
+        self._game_process = None
+        self._game_started_at = 0.0
+        self._process_status = "正在启动…"
+        self._refresh_process_panel()
         worker.start()
 
     def _set_launching(self, launching: bool) -> None:
         self._launching = launching
-        self.launch_button.setText("停止游戏" if launching else "启动游戏")
+        self.launch_button.setText("结束游戏" if launching else "启动游戏")
         self.inst_launch_button.setEnabled(
             not launching and self._selected_instance() is not None
         )
@@ -1676,17 +1848,116 @@ class MainWindow(QMainWindow):
         self._set_launching(False)
         self.launch_status.setText(f"游戏已退出（代码 {code}）")
         self._append_launch_log(f"[launcher] Minecraft 退出，代码 {code}")
+        self._game_process = None
+        self._process_status = f"已退出（代码 {code}）"
+        self._process_timer.stop()
+        self._refresh_process_panel()
 
     def _launch_failed(self, message: str) -> None:
         self._set_launching(False)
         self.launch_status.setText("启动失败")
         self._append_launch_log(f"[error] {message}")
+        self._game_process = None
+        self._process_status = "启动失败"
+        self._process_timer.stop()
+        self._refresh_process_panel()
         QMessageBox.critical(self, "启动失败", message)
 
     def _stop_launch(self) -> None:
         if self._launch_worker is not None and self._launch_worker.isRunning():
             self._launch_worker.stop()
             self.launch_status.setText("正在停止…")
+
+    # ------------------------------------------------------------ process panel
+
+    def _game_process_started(self, process) -> None:
+        self._game_process = process
+        self._game_started_at = time.time()
+        self._process_timer.start()
+        self._refresh_process_panel()
+
+    def _toggle_process_details(self) -> None:
+        self._process_expanded = not self._process_expanded
+        self._refresh_process_panel()
+
+    def _refresh_process_panel(self) -> None:
+        arrow = "▾" if self._process_expanded else "▸"
+        active: list[str] = []
+
+        process = self._game_process
+        if process is not None and process.poll() is None:
+            active.append(f"游戏 PID {process.pid}")
+        elif self._launching:
+            active.append("游戏启动中")
+        if self._install_running():
+            active.append("下载中")
+        if self._version_running():
+            active.append("获取版本列表")
+
+        summary = " · ".join(active) if active else "空闲"
+        self.process_header.setText(f"{arrow} 进程 · {summary}")
+        self._sync_process_details(self._process_detail_html())
+
+    def _sync_process_details(self, text: str) -> None:
+        self.process_details.setText(text)
+        self.process_details.setVisible(self._process_expanded and bool(text))
+
+    def _install_running(self) -> bool:
+        return self._install_worker is not None and self._install_worker.isRunning()
+
+    def _version_running(self) -> bool:
+        return self._version_worker is not None and self._version_worker.isRunning()
+
+    def _process_detail_html(self) -> str:
+        blocks: list[str] = []
+
+        process = self._game_process
+        if process is not None and process.poll() is None:
+            elapsed = time.time() - self._game_started_at
+            parts = [f"PID {process.pid}", f"运行 {self._format_elapsed(elapsed)}"]
+            if psutil is not None:
+                try:
+                    rss = psutil.Process(process.pid).memory_info().rss / (1024 * 1024)
+                    parts.append(f"内存 {rss:.0f} MB")
+                except Exception:  # 进程刚好退出或没有权限
+                    pass
+            blocks.append("<b>游戏进程</b>：" + " · ".join(parts))
+            args = process.args
+            command = " ".join(args) if isinstance(args, (list, tuple)) else str(args)
+            if len(command) > 200:
+                command = command[:200] + "…"
+            blocks.append(f"命令行：{command}")
+        elif self._launching:
+            blocks.append("<b>游戏进程</b>：正在启动…")
+        else:
+            blocks.append(f"<b>游戏进程</b>：{self._process_status}")
+
+        if self._install_running():
+            maximum = self.download_progress.maximum()
+            if maximum > 0:
+                progress = f"{self.download_progress.value() * 100 // maximum}%"
+            else:
+                progress = "准备中"
+            name = self._install_version or "未知版本"
+            directory = self._pending_download[1] if self._pending_download else ""
+            block = f"<b>下载/安装</b>：{name} · {progress} · 已用 {self._install_seconds} 秒"
+            if directory:
+                block += f"<br>目录：{directory}"
+            blocks.append(block)
+
+        if self._version_running():
+            blocks.append("<b>版本列表</b>：正在从服务器获取…")
+
+        return "<br>".join(blocks)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = int(seconds)
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
     def _append_launch_log(self, line: str) -> None:
         self.launch_log.appendPlainText(line)
@@ -1706,6 +1977,7 @@ class MainWindow(QMainWindow):
         if self._launch_worker is not None and self._launch_worker.isRunning():
             self._launch_worker.stop()
             self._launch_worker.wait(3000)
+        self._process_timer.stop()
         event.accept()
 
 

@@ -15,7 +15,13 @@ from .install import InstallError, install_version
 from .java import JavaError, choose_java, detect_java, inspect_java
 from .launch import LaunchError, build_launch_spec, format_command, run_game
 from .mirror import enable_mirror, mirror_name
-from .version import VersionError, fetch_version_summary, latest_versions, list_versions
+from .version import (
+    VersionError,
+    fetch_version_summary,
+    latest_versions,
+    list_versions,
+    repair,
+)
 
 
 def _format_date(value: Any) -> str:
@@ -41,8 +47,8 @@ def _cmd_versions(args: argparse.Namespace) -> int:
     if args.release_only:
         versions = [item for item in versions if item.get("type") == "release"]
 
-    print(f"Latest release : {latest['release']}")
-    print(f"Latest snapshot: {latest['snapshot']}")
+    print(f"Latest release : {latest.get('release', '-')}")
+    print(f"Latest snapshot: {latest.get('snapshot', '-')}")
     print(f"Game directory : {GAME_DIR}")
     print(f"Mirror         : {mirror_name()}")
     print()
@@ -98,6 +104,28 @@ def _cmd_install(args: argparse.Namespace) -> int:
         print(f"Java runtime   : {result.java_executable}")
     else:
         print("Java runtime   : skipped (using system Java)")
+    return 0
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    game_dir = args.game_dir.expanduser() if args.game_dir else None
+    try:
+        report = repair(game_dir)
+    except VersionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"game directory : {report['game_dir']}")
+    print(f"scanned        : {report['scanned']}")
+    print(f"mismatched     : {report['fixed']}")
+    print(f"meta updated   : {report['updated']}")
+    if report["rows"]:
+        print()
+        print("版本ID | 当前错误分类 | 正确分类 | 原因")
+        for row in report["rows"]:
+            print(f"{row['id']} | {row['old']} | {row['new']} | {row['reason']}")
+    print()
+    print(f"metadata       : {report['meta_path']}")
     return 0
 
 
@@ -220,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mirror",
         choices=("mojang", "bmclapi"),
-        help="Download source (default: mojang, or $MC_MIRROR)",
+        help="Download source (default: bmclapi, or $MC_MIRROR)",
     )
 
     mirror_parent = argparse.ArgumentParser(add_help=False)
@@ -263,6 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Java home or executable; a compatible one skips the JRE download",
     )
     install_parser.set_defaults(func=_cmd_install)
+
+    repair_parser = subparsers.add_parser(
+        "repair",
+        parents=[mirror_parent],
+        help="Rescan local versions, fix category metadata and print a diff",
+    )
+    repair_parser.add_argument("--game-dir", type=Path, help="Override the game directory")
+    repair_parser.set_defaults(func=_cmd_repair)
 
     login_parser = subparsers.add_parser(
         "login", parents=[mirror_parent], help="Create an offline account (username only)"

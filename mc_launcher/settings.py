@@ -114,7 +114,7 @@ class Settings:
     default_account: str | None = None
     java_paths: list[str] = field(default_factory=list)
     default_java: str | None = None
-    mirror: str = "mojang"
+    mirror: str = "bmclapi"
     max_memory: int = DEFAULT_MAX_MEMORY
     min_memory: int = DEFAULT_MIN_MEMORY
     show_log: bool = False
@@ -157,9 +157,9 @@ class Settings:
             value = data.get(key)
             return value if isinstance(value, int) and value > 0 else default
 
-        mirror = str(data.get("mirror") or "mojang").lower()
+        mirror = str(data.get("mirror") or "bmclapi").lower()
         if mirror not in MIRRORS:
-            mirror = "mojang"
+            mirror = "bmclapi"
 
         accounts = [str(name) for name in data.get("accounts", []) if str(name).strip()]
         settings = cls(

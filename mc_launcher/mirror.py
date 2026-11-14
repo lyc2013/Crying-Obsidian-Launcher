@@ -43,7 +43,7 @@ _FALLBACK = os.environ.get("MC_MIRROR_FALLBACK", "1") != "0"
 
 
 def mirror_name() -> str:
-    return os.environ.get("MC_MIRROR", "mojang").strip().lower() or "mojang"
+    return os.environ.get("MC_MIRROR", "bmclapi").strip().lower() or "bmclapi"
 
 
 def set_mirror(name: str) -> None:

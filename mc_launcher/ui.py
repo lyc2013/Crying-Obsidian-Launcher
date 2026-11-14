@@ -628,6 +628,7 @@ class MainWindow(QMainWindow):
         self.resize(980, 720)
 
         self._build_ui()
+        self._process_timer.start()
         self._detect_java()
         self._refresh_all()
         self._fetch_online_versions()
@@ -2338,7 +2339,6 @@ class MainWindow(QMainWindow):
         self._append_launch_log(f"[launcher] Minecraft 退出，代码 {code}")
         self._game_process = None
         self._process_status = f"已退出（代码 {code}）"
-        self._process_timer.stop()
         self._refresh_process_panel()
 
     def _launch_failed(self, message: str) -> None:
@@ -2347,7 +2347,6 @@ class MainWindow(QMainWindow):
         self._append_launch_log(f"[error] {message}")
         self._game_process = None
         self._process_status = "启动失败"
-        self._process_timer.stop()
         self._refresh_process_panel()
         QMessageBox.critical(self, "启动失败", message)
 
@@ -2381,17 +2380,31 @@ class MainWindow(QMainWindow):
             active.append("下载中")
         if self._version_running():
             active.append("获取版本列表")
+        resource_downloads = self._resource_downloads()
+        if resource_downloads:
+            active.append(f"资源下载 {len(resource_downloads)}")
 
         summary = " · ".join(active) if active else "空闲"
         self.process_header.setText(f"{arrow} 进程 · {summary}")
         self._sync_process_details(self._process_detail_html())
+
+    def _resource_downloads(self) -> list[dict]:
+        browser = getattr(self, "resource_browser", None)
+        if browser is None:
+            return []
+        try:
+            return browser.active_downloads()
+        except RuntimeError:
+            return []
 
     def _sync_process_details(self, text: str) -> None:
         self.process_details.setText(text)
         self.process_details.setVisible(self._process_expanded and bool(text))
 
     def _install_running(self) -> bool:
-        return self._install_worker is not None and self._install_worker.isRunning()
+        if self._install_worker is not None and self._install_worker.isRunning():
+            return True
+        return self._loader_worker is not None and self._loader_worker.isRunning()
 
     def _version_running(self) -> bool:
         return self._version_worker is not None and self._version_worker.isRunning()
@@ -2432,6 +2445,27 @@ class MainWindow(QMainWindow):
             if directory:
                 block += f"<br>目录：{directory}"
             blocks.append(block)
+
+        if self._loader_worker is not None and self._loader_worker.isRunning():
+            label = self.download_loader_combo.currentText() if hasattr(
+                self, "download_loader_combo"
+            ) else "加载器"
+            blocks.append(
+                f"<b>安装加载器</b>：{self._install_version or '未知版本'} · {label}"
+            )
+
+        resource_downloads = self._resource_downloads()
+        for entry in resource_downloads[:6]:
+            title = str(entry.get("title") or "")
+            if len(title) > 60:
+                title = title[:60] + "…"
+            info = str(entry.get("info") or "")
+            blocks.append(
+                f"<b>资源下载</b>（{entry.get('kind', '')}）：{title} · "
+                f"{entry.get('percent', 0)}% · {info}"
+            )
+        if len(resource_downloads) > 6:
+            blocks.append(f"…其余 {len(resource_downloads) - 6} 个下载任务")
 
         if self._version_running():
             blocks.append("<b>版本列表</b>：正在从服务器获取…")

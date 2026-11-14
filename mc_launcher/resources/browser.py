@@ -744,7 +744,6 @@ class ResourcePage(QWidget):
         worker.failed.connect(lambda _message: reset_flag())
         worker.cancelled.connect(reset_flag)
         worker.finished.connect(lambda: self._apply_modpack_result(worker, base, item))
-        worker.start()
 
     def _apply_modpack_result(self, worker: DownloadWorker, base: Path, item: ResourceItem) -> None:
         result = worker.result if isinstance(worker.result, dict) else None
@@ -795,23 +794,40 @@ class ResourcePage(QWidget):
             row["close"].setVisible(True)
 
         def on_failed(message: str) -> None:
+            row["bar"].setRange(0, 100)
+            row["bar"].setValue(0)
             row["label"].setText(f"{title} · 下载失败")
             row["info"].setText(message)
             row["cancel"].setVisible(False)
             row["close"].setVisible(True)
 
         def on_cancelled() -> None:
+            row["bar"].setRange(0, 100)
+            row["bar"].setValue(0)
             row["label"].setText(f"{title} · 已取消")
+            row["info"].setText("已停止下载")
             row["cancel"].setVisible(False)
             row["close"].setVisible(True)
+
+        def on_cancel_clicked() -> None:
+            # A blocking HTTP read can delay the worker's cancellation signal,
+            # so update the row right away.
+            row["bar"].setRange(0, 100)
+            row["bar"].setValue(0)
+            row["label"].setText(f"{title} · 正在取消…")
+            row["info"].setText("已停止下载")
+            row["cancel"].setVisible(False)
+            row["close"].setVisible(True)
+            worker.cancel()
 
         worker.progress.connect(on_progress)
         worker.status.connect(on_status)
         worker.succeeded.connect(on_done)
         worker.failed.connect(on_failed)
         worker.cancelled.connect(on_cancelled)
+        worker.finished.connect(lambda: self._workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
-        row["cancel"].clicked.connect(worker.cancel)
+        row["cancel"].clicked.connect(on_cancel_clicked)
         row["close"].clicked.connect(lambda: self._remove_queue_row(row))
         worker.start()
         return row
@@ -857,10 +873,30 @@ class ResourcePage(QWidget):
 
     def _remove_queue_row(self, row: dict) -> None:
         frame = row.get("frame")
+        self._queue_rows.pop(id(frame), None)
         if frame is not None:
             frame.deleteLater()
-        if not any(entry.get("frame") is not None for entry in self._queue_rows.values()):
+        if not self._queue_rows:
             self.queue_host.setVisible(False)
+
+    def active_downloads(self) -> list[dict]:
+        """Running download rows, for the launcher's process panel."""
+        entries: list[dict] = []
+        for row in self._queue_rows.values():
+            worker = row.get("worker")
+            if worker is None or not worker.isRunning():
+                continue
+            bar = row["bar"]
+            maximum = bar.maximum()
+            percent = int(bar.value() * 100 / maximum) if maximum > 0 else 0
+            entries.append(
+                {
+                    "title": row["label"].text(),
+                    "percent": percent,
+                    "info": row["info"].text(),
+                }
+            )
+        return entries
 
     def shutdown(self) -> None:
         self._gen += 1
@@ -897,6 +933,15 @@ class ResourceBrowser(QTabWidget):
     def _refresh_targets(self) -> None:
         for page in self.pages.values():
             page.refresh_targets()
+
+    def active_downloads(self) -> list[dict]:
+        entries: list[dict] = []
+        for kind, page in self.pages.items():
+            for entry in page.active_downloads():
+                item = dict(entry)
+                item["kind"] = KIND_LABELS.get(kind, kind)
+                entries.append(item)
+        return entries
 
     def apply_settings(self) -> None:
         for page in self.pages.values():

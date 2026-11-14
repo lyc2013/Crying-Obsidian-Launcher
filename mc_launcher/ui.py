@@ -814,6 +814,9 @@ class MainWindow(QMainWindow):
         self.inst_loader_button = QPushButton("安装加载器…")
         self.inst_loader_button.clicked.connect(self._open_loader_dialog)
         right_actions.addWidget(self.inst_loader_button)
+        self.inst_resources_button = QPushButton("资源管理…")
+        self.inst_resources_button.clicked.connect(self._open_resource_manager)
+        right_actions.addWidget(self.inst_resources_button)
         self.inst_delete_button = QPushButton("删除实例")
         self.inst_delete_button.clicked.connect(self._delete_instance)
         right_actions.addWidget(self.inst_delete_button)
@@ -1472,6 +1475,7 @@ class MainWindow(QMainWindow):
             self.inst_default_button,
             self.inst_launch_button,
             self.inst_loader_button,
+            self.inst_resources_button,
             self.inst_delete_button,
         ):
             button.setEnabled(enabled)
@@ -1546,6 +1550,22 @@ class MainWindow(QMainWindow):
             self.download_status.setText(
                 f"实例「{instance.name}」已切换为 {dialog.installed_version_id}"
             )
+
+    def _open_resource_manager(self) -> None:
+        instance = self._selected_instance()
+        if instance is None:
+            QMessageBox.warning(self, "未选择实例", "请先在左侧选择一个实例")
+            return
+        record = self.settings.game_dir_for_instance(instance)
+        if self.settings.get_effective_isolation(record.id):
+            game_root = self.settings.effective_game_root(instance)
+        else:
+            game_root = Path(instance.game_dir).expanduser()
+
+        from .resource_manager import ResourceManagerDialog
+
+        dialog = ResourceManagerDialog(self, instance, game_root)
+        dialog.exec()
 
     def _update_instance_isolation_label(self, instance: Instance) -> None:
         game_dir = self.settings.game_dir_for_instance(instance)

@@ -56,6 +56,7 @@ from .auth import AuthError, offline_account
 from .config import APP_NAME, GAME_DIR
 from .install import install_version, is_file_status
 from .java import JavaError, JavaInstallation, detect_java, inspect_java
+from .layout import Layout, STYLE_MULTIMC, STYLE_PCL, resolve_layout
 from .launch import LaunchError, build_launch_spec, run_game
 from .resources.mapper import version_key
 from .mirror import (
@@ -87,6 +88,7 @@ from .version import (
     instance_version_info,
     list_versions,
     loader_label,
+    scan_local_versions,
 )
 
 TAB_LAUNCH = 0
@@ -152,8 +154,8 @@ class SideTabBar(QTabBar):
             painter.restore()
 
 
-def installed_versions(game_dir: Path) -> list[str]:
-    base = game_dir / "versions"
+def installed_versions(layout: Layout) -> list[str]:
+    base = layout.versions_dir
     if not base.is_dir():
         return []
 
@@ -161,10 +163,10 @@ def installed_versions(game_dir: Path) -> list[str]:
     for entry in base.iterdir():
         if not entry.is_dir():
             continue
-        json_path = entry / f"{entry.name}.json"
+        json_path = layout.version_json(entry.name)
         if not json_path.is_file():
             continue
-        if not (entry / f"{entry.name}.jar").is_file():
+        if not layout.version_jar(entry.name).is_file():
             # Forge/Fabric and modpacks only ship a JSON that inheritsFrom a
             # vanilla version, so the client jar comes from the parent.
             try:
@@ -195,11 +197,11 @@ class InstallWorker(QThread):
     failed = Signal(str)
 
     def __init__(
-        self, version: str, game_dir: Path, java_path: str | None = None, java_paths: list[str] | None = None
+        self, version: str, layout: Layout, java_path: str | None = None, java_paths: list[str] | None = None
     ) -> None:
         super().__init__()
         self._version = version
-        self._game_dir = game_dir
+        self._layout = layout
         self._java_path = java_path
         self._java_paths = java_paths
         self._maximum = 0
@@ -209,7 +211,7 @@ class InstallWorker(QThread):
         try:
             result = install_version(
                 self._version,
-                game_dir=self._game_dir,
+                layout=self._layout,
                 printer=self._printer,
                 java_path=self._java_path,
                 java_paths=self._java_paths,
@@ -260,7 +262,7 @@ class LaunchWorker(QThread):
         self,
         version: str,
         username: str,
-        game_dir: Path,
+        layout: Layout,
         java_path: str | None,
         max_memory: int,
         min_memory: int,
@@ -271,8 +273,8 @@ class LaunchWorker(QThread):
         super().__init__()
         self._version = version
         self._username = username
-        self._game_dir = game_dir
-        self._game_root = game_root or game_dir
+        self._layout = layout
+        self._game_root = game_root or layout.game_root
         self._java_path = java_path
         self._java_candidates = java_candidates
         self._max_memory = max_memory
@@ -286,7 +288,7 @@ class LaunchWorker(QThread):
             spec = build_launch_spec(
                 self._version,
                 self._username,
-                game_dir=self._game_dir,
+                layout=self._layout,
                 game_root=self._game_root,
                 java_path=self._java_path,
                 memory_mb=self._max_memory,
@@ -364,13 +366,13 @@ class LoaderInstallWorker(QThread):
         self,
         loader_id: str,
         mc_version: str,
-        game_dir: Path,
+        layout: Layout,
         loader_version: str | None = None,
     ) -> None:
         super().__init__()
         self._loader_id = loader_id
         self._mc_version = mc_version
-        self._game_dir = game_dir
+        self._layout = layout
         self._loader_version = loader_version
         self._cancel = threading.Event()
         self._maximum = 0
@@ -389,7 +391,7 @@ class LoaderInstallWorker(QThread):
             version_id = loaders.install_loader(
                 self._loader_id,
                 self._mc_version,
-                self._game_dir,
+                self._layout,
                 loader_version=self._loader_version,
                 callback=callback(),
                 cancel=self._cancel,
@@ -417,14 +419,14 @@ class LoaderInstallDialog(QDialog):
         self,
         parent,
         mc_version: str,
-        game_dir: Path,
+        layout: Layout,
         current_loader: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("安装加载器")
         self.resize(480, 320)
         self.mc_version = mc_version
-        self.game_dir = game_dir
+        self.layout = layout
         self.installed_version_id: str | None = None
         self._worker: LoaderInstallWorker | None = None
         self._versions_worker: LoaderVersionsWorker | None = None
@@ -481,7 +483,7 @@ class LoaderInstallDialog(QDialog):
         self.version_combo.clear()
         self.version_combo.addItem("正在获取版本…", None)
         self.version_combo.setEnabled(False)
-        installed = loaders.installed_loader_version(loader_id, self.mc_version, self.game_dir)
+        installed = loaders.installed_loader_version(loader_id, self.mc_version, self.layout)
         if installed:
             self.hint_label.setText(f"该版本已安装 {loader_id}：{installed}（可为其他实例重新安装）")
         else:
@@ -531,7 +533,7 @@ class LoaderInstallDialog(QDialog):
         self._append(f"开始安装 {loader_id} {loader_version}（MC {self.mc_version}）")
 
         worker = LoaderInstallWorker(
-            loader_id, self.mc_version, self.game_dir, loader_version
+            loader_id, self.mc_version, self.layout, loader_version
         )
         worker.status_changed.connect(self._append)
         worker.progress_changed.connect(self._on_progress)
@@ -583,6 +585,82 @@ class LoaderInstallDialog(QDialog):
         if self._versions_worker is not None and self._versions_worker.isRunning():
             self._versions_worker.wait(3000)
         super().reject()
+
+
+class ImportGameDirDialog(QDialog):
+    """Scan a game directory and let the user correct its layout once."""
+
+    SOURCE_LABELS = {
+        "marker": "自动识别（标记文件）",
+        "manual": "手动指定",
+        "auto": "自动识别",
+        "default": "未识别，按默认处理，可手动指定",
+        "legacy": "旧式游戏目录（按 PCL 处理）",
+    }
+
+    def __init__(self, parent, path: Path, default_style: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("导入游戏目录")
+        self.resize(520, 300)
+        self.path = path
+        # Detection preview only: the marker is written after the user confirms.
+        self.layout, self.info = resolve_layout(path, default_style, persist=False)
+        self.detected_style = self.layout.style
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(QLabel(f"目录：{path}"))
+        self.result_label = QLabel()
+        self.result_label.setWordWrap(True)
+        outer.addWidget(self.result_label)
+
+        form = QFormLayout()
+        self.style_combo = QComboBox()
+        self.style_combo.addItem("PCL（版本、libraries、assets 都在客户端目录）", STYLE_PCL)
+        self.style_combo.addItem("MultiMC（libraries、assets 在游戏目录上层）", STYLE_MULTIMC)
+        index = self.style_combo.findData(self.layout.style)
+        if index >= 0:
+            self.style_combo.setCurrentIndex(index)
+        self.style_combo.currentIndexChanged.connect(self._update_result)
+        form.addRow("目录结构", self.style_combo)
+        outer.addLayout(form)
+
+        self.note = QLabel(
+            "确认前可纠正一次；纠正会写入手动标记并锁定，之后自动识别不再覆盖。\n"
+            "本启动器不会移动、复制或重命名任何已有文件。"
+        )
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color: palette(mid);")
+        outer.addWidget(self.note)
+        outer.addStretch(1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        confirm = QPushButton("导入")
+        confirm.clicked.connect(self.accept)
+        buttons.addWidget(confirm)
+        outer.addLayout(buttons)
+
+        self._update_result()
+
+    def chosen_style(self) -> str:
+        return self.style_combo.currentData()
+
+    def _update_result(self) -> None:
+        version_count = len(scan_local_versions(self.layout))
+        source = self.SOURCE_LABELS.get(self.info.source, self.info.source)
+        self.result_label.setText(
+            f"当前识别为：{self.layout.style.upper()}（{source}）\n"
+            f"发现 {version_count} 个已安装版本"
+        )
+
+    def accept(self) -> None:
+        chosen = self.chosen_style()
+        if chosen != self.layout.style:
+            self.layout = Layout(self.path, chosen, direct=self.layout.direct)
+        super().accept()
 
 
 class MainWindow(QMainWindow):
@@ -1068,11 +1146,34 @@ class MainWindow(QMainWindow):
         self.isolation_check.toggled.connect(self._global_isolation_toggled)
         isolation_layout.addWidget(self.isolation_check)
 
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("默认目录结构"))
+        self.default_layout_combo = QComboBox()
+        self.default_layout_combo.addItem("PCL", STYLE_PCL)
+        self.default_layout_combo.addItem("MultiMC", STYLE_MULTIMC)
+        layout_row.addWidget(self.default_layout_combo, 1)
+        isolation_layout.addLayout(layout_row)
+        layout_hint = QLabel(
+            "只影响新建目录和未标记的已有目录；已手动指定或已识别落标记的目录不受影响。"
+        )
+        layout_hint.setWordWrap(True)
+        layout_hint.setStyleSheet("color: palette(mid);")
+        isolation_layout.addWidget(layout_hint)
+
         isolation_layout.addWidget(QLabel("游戏目录（目录级设置优先于全局）："))
         self.game_dir_list = QListWidget()
         self.game_dir_list.setMaximumHeight(130)
         self.game_dir_list.currentItemChanged.connect(self._game_dir_selected)
         isolation_layout.addWidget(self.game_dir_list)
+
+        self.dir_layout_label = QLabel("")
+        self.dir_layout_label.setWordWrap(True)
+        isolation_layout.addWidget(self.dir_layout_label)
+        self.dir_layout_combo = QComboBox()
+        self.dir_layout_combo.addItem("PCL", STYLE_PCL)
+        self.dir_layout_combo.addItem("MultiMC", STYLE_MULTIMC)
+        self.dir_layout_combo.currentIndexChanged.connect(self._directory_layout_changed)
+        isolation_layout.addWidget(self.dir_layout_combo)
 
         self.iso_override_combo = QComboBox()
         self.iso_override_combo.addItem("跟随全局", ISOLATION_GLOBAL)
@@ -1118,7 +1219,9 @@ class MainWindow(QMainWindow):
     def _ensure_first_instance(self) -> None:
         if self.settings.instances:
             return
-        versions = installed_versions(GAME_DIR)
+        versions = installed_versions(
+            resolve_layout(GAME_DIR, self.settings.default_layout)[0]
+        )
         if not versions:
             return
         self.settings.add_instance("默认实例", versions[0], GAME_DIR)
@@ -1155,6 +1258,9 @@ class MainWindow(QMainWindow):
         self.isolation_check.setChecked(self.settings.instance_isolation)
         self.launch_log.setVisible(self.settings.show_log)
 
+        index = self.default_layout_combo.findData(self.settings.default_layout)
+        self.default_layout_combo.setCurrentIndex(index if index >= 0 else 0)
+
         index = self.resource_source_combo.findData(self.settings.resource_source)
         self.resource_source_combo.setCurrentIndex(index if index >= 0 else 0)
         self.curseforge_key_edit.setText(self.settings.curseforge_api_key)
@@ -1183,7 +1289,10 @@ class MainWindow(QMainWindow):
         self.game_dir_list.blockSignals(True)
         self.game_dir_list.clear()
         for entry in self.settings.game_dirs:
-            item = QListWidgetItem(f"{entry.path}  ·  {labels[entry.isolation_override]}")
+            item = QListWidgetItem(
+                f"{entry.path}  ·  {entry.layout_style.upper()}  ·  "
+                f"{labels[entry.isolation_override]}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, entry.id)
             self.game_dir_list.addItem(item)
         self.game_dir_list.blockSignals(False)
@@ -1199,6 +1308,8 @@ class MainWindow(QMainWindow):
         else:
             self.iso_override_combo.setCurrentIndex(0)
             self.iso_effective_label.setText("尚未添加游戏目录")
+            self.dir_layout_label.setText("尚未添加游戏目录")
+            self.dir_layout_combo.setEnabled(False)
 
     def _selected_game_dir(self) -> GameDirectory | None:
         item = self.game_dir_list.currentItem()
@@ -1213,11 +1324,46 @@ class MainWindow(QMainWindow):
         entry = self._selected_game_dir()
         if entry is None:
             return
+        self.dir_layout_combo.blockSignals(True)
+        index = self.dir_layout_combo.findData(entry.layout_style)
+        self.dir_layout_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.dir_layout_combo.blockSignals(False)
+        self.dir_layout_combo.setEnabled(True)
+        source = ImportGameDirDialog.SOURCE_LABELS.get(
+            entry.layout_source, entry.layout_source
+        )
+        self.dir_layout_label.setText(
+            f"当前识别为：{entry.layout_style.upper()}（{source}）"
+        )
         self.iso_override_combo.blockSignals(True)
         index = self.iso_override_combo.findData(entry.isolation_override)
         self.iso_override_combo.setCurrentIndex(index if index >= 0 else 0)
         self.iso_override_combo.blockSignals(False)
         self._update_isolation_preview()
+
+    def _directory_layout_changed(self, *_args) -> None:
+        entry = self._selected_game_dir()
+        if entry is None:
+            return
+        style = self.dir_layout_combo.currentData() or STYLE_PCL
+        if style == entry.layout_style:
+            return
+
+        info = self.settings.set_directory_layout(entry, style)
+        self._persist()
+        self._refresh_game_dir_list_text(entry)
+        self._refresh_instance_list(select_id=self.settings.default_instance_id)
+        self._refresh_launch_info()
+        self._game_dir_selected()
+        QMessageBox.information(
+            self,
+            "目录结构已切换",
+            f"已写入标记：{info.style.upper()}\n\n"
+            "本启动器从此按新布局读写该目录，已有文件不会被自动移动。",
+        )
+        self.download_status.setText(
+            f"目录 {entry.path} 已切换为 {info.style.upper()} 布局"
+        )
 
     def _override_changed(self, *_args) -> None:
         entry = self._selected_game_dir()
@@ -1239,7 +1385,10 @@ class MainWindow(QMainWindow):
         }
         item = self.game_dir_list.currentItem()
         if item is not None and item.data(Qt.ItemDataRole.UserRole) == entry.id:
-            item.setText(f"{entry.path}  ·  {labels[entry.isolation_override]}")
+            item.setText(
+                f"{entry.path}  ·  {entry.layout_style.upper()}  ·  "
+                f"{labels[entry.isolation_override]}"
+            )
 
     def _global_isolation_toggled(self, enabled: bool) -> None:
         # Update in memory so the preview reflects the toggle before saving.
@@ -1322,17 +1471,18 @@ class MainWindow(QMainWindow):
         self.instance_tree.clear()
         for entry in self.settings.game_dirs:
             children = grouped.get(entry.id, [])
-            root = QTreeWidgetItem([f"{entry.path}（{len(children)} 个实例）"])
+            style = entry.layout_style.upper()
+            root = QTreeWidgetItem([f"{entry.path} · {style}（{len(children)} 个实例）"])
             root.setData(0, Qt.ItemDataRole.UserRole, ("dir", entry.id))
-            root.setToolTip(0, f"{entry.path}（{len(children)} 个实例）")
+            root.setToolTip(0, f"{entry.path}\n目录结构：{style}（{len(children)} 个实例）")
             self.instance_tree.addTopLevelItem(root)
 
             for instance in children:
                 suffix = "  [默认]" if instance.id == self.settings.default_instance_id else ""
-                game_dir_path = Path(instance.game_dir).expanduser()
-                loader = loader_label(instance.version, game_dir_path)
+                layout = self.settings.layout_for_instance(instance)
+                loader = loader_label(instance.version, layout)
                 base_version, category = instance_version_info(
-                    instance.version, game_dir_path
+                    instance.version, layout
                 )
                 text = (
                     f"{instance.name}  ·  {base_version}  ·  {category}  "
@@ -1405,9 +1555,9 @@ class MainWindow(QMainWindow):
         account = self.settings.default_account
         if instance:
             extra = "（独立内存）" if instance.max_memory else "（全局内存）"
-            game_dir_path = Path(instance.game_dir).expanduser()
-            loader = loader_label(instance.version, game_dir_path)
-            base_version, category = instance_version_info(instance.version, game_dir_path)
+            layout = self.settings.layout_for_instance(instance)
+            loader = loader_label(instance.version, layout)
+            base_version, category = instance_version_info(instance.version, layout)
             base = (
                 f"默认实例：{instance.name}（{base_version} · {category} · {loader}）{extra}"
             )
@@ -1486,7 +1636,8 @@ class MainWindow(QMainWindow):
 
         self.inst_version_combo.blockSignals(True)
         self.inst_version_combo.clear()
-        versions = installed_versions(Path(instance.game_dir).expanduser())
+        layout = self.settings.layout_for_instance(instance)
+        versions = installed_versions(layout)
         if instance.version and instance.version not in versions:
             versions.insert(0, instance.version)
         self.inst_version_combo.addItems(versions)
@@ -1515,9 +1666,9 @@ class MainWindow(QMainWindow):
             self.inst_base_version_label.setText("—")
             self.inst_category_label.setText("—")
             return
-        game_dir = Path(directory).expanduser()
-        self.inst_loader_label.setText(loader_label(version, game_dir))
-        base_version, category = instance_version_info(version, game_dir)
+        layout = resolve_layout(directory, self.settings.default_layout, persist=False)[0]
+        self.inst_loader_label.setText(loader_label(version, layout))
+        base_version, category = instance_version_info(version, layout)
         self.inst_base_version_label.setText(base_version)
         self.inst_category_label.setText(category)
 
@@ -1526,19 +1677,13 @@ class MainWindow(QMainWindow):
         if instance is None:
             QMessageBox.warning(self, "未选择实例", "请先在左侧选择一个实例")
             return
-        record = self.settings.game_dir_for_instance(instance)
-        if self.settings.get_effective_isolation(record.id):
-            game_dir = self.settings.effective_game_root(instance)
-        else:
-            game_dir = Path(instance.game_dir).expanduser()
-        base_version, _category = instance_version_info(
-            instance.version, Path(instance.game_dir).expanduser()
-        )
+        layout = self.settings.layout_for_instance(instance)
+        base_version, _category = instance_version_info(instance.version, layout)
         mc_version = base_version if base_version and base_version != "—" else instance.version
-        current_label = loader_label(instance.version, game_dir)
+        current_label = loader_label(instance.version, layout)
         current_loader = loaders.LOADER_IDS.get(current_label)
 
-        dialog = LoaderInstallDialog(self, mc_version, game_dir, current_loader)
+        dialog = LoaderInstallDialog(self, mc_version, layout, current_loader)
         if (
             dialog.exec() == QDialog.DialogCode.Accepted
             and dialog.installed_version_id
@@ -1556,15 +1701,11 @@ class MainWindow(QMainWindow):
         if instance is None:
             QMessageBox.warning(self, "未选择实例", "请先在左侧选择一个实例")
             return
-        record = self.settings.game_dir_for_instance(instance)
-        if self.settings.get_effective_isolation(record.id):
-            game_root = self.settings.effective_game_root(instance)
-        else:
-            game_root = Path(instance.game_dir).expanduser()
+        layout = self.settings.effective_layout(instance)
 
         from .resource_manager import ResourceManagerDialog
 
-        dialog = ResourceManagerDialog(self, instance, game_root)
+        dialog = ResourceManagerDialog(self, instance, layout)
         dialog.exec()
 
     def _update_instance_isolation_label(self, instance: Instance) -> None:
@@ -1576,7 +1717,7 @@ class MainWindow(QMainWindow):
             ISOLATION_FORCE_OFF: "强制关闭",
         }
         if effective:
-            root = self.settings.effective_game_root(instance)
+            root = self.settings.effective_layout(instance).game_root
             text = f"开启（{override_labels[game_dir.isolation_override]}）→ {root}"
         else:
             text = (
@@ -1597,7 +1738,8 @@ class MainWindow(QMainWindow):
     def _reload_instance_versions(self) -> None:
         directory = Path(self.inst_dir_edit.text().strip()).expanduser()
         current = self.inst_version_combo.currentText().strip()
-        versions = installed_versions(directory)
+        layout = resolve_layout(directory, self.settings.default_layout, persist=False)[0]
+        versions = installed_versions(layout)
         if current and current not in versions:
             versions.insert(0, current)
         self.inst_version_combo.clear()
@@ -1683,15 +1825,25 @@ class MainWindow(QMainWindow):
 
     def _add_game_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(
-            self, "选择游戏目录（.minecraft 根目录）"
+            self, "选择游戏目录（PCL 分组目录或 MultiMC 实例目录）"
         )
         if not directory:
             return
 
         path = Path(directory).expanduser()
-        entry = self.settings.register_game_dir(path)
+        dialog = ImportGameDirDialog(self, path, self.settings.default_layout)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
 
-        versions = installed_versions(path)
+        entry = self.settings.register_game_dir(path)
+        if dialog.chosen_style() != dialog.detected_style:
+            entry_info = self.settings.set_directory_layout(entry, dialog.chosen_style())
+            self.download_status.setText(
+                f"已按 {entry_info.style.upper()} 布局读取该目录；已有文件不会被自动移动"
+            )
+        layout = self.settings.layout_for_entry(entry)
+
+        versions = installed_versions(layout)
         created = self.settings.import_instances(path, versions)
 
         self._persist()
@@ -1719,7 +1871,7 @@ class MainWindow(QMainWindow):
         if entry is None:
             if not self.settings.game_dirs:
                 QMessageBox.warning(
-                    self, "没有游戏目录", "请先点「添加游戏目录…」选择一个 .minecraft 目录"
+                    self, "没有游戏目录", "请先点「添加游戏目录…」选择一个游戏目录"
                 )
                 return
             labels = [item.path for item in self.settings.game_dirs]
@@ -1730,8 +1882,7 @@ class MainWindow(QMainWindow):
                 return
             entry = self.settings.game_dirs[labels.index(choice)]
 
-        directory = Path(entry.path).expanduser()
-        versions = installed_versions(directory)
+        versions = installed_versions(self.settings.layout_for_entry(entry))
         if not versions:
             QMessageBox.warning(
                 self,
@@ -1938,17 +2089,18 @@ class MainWindow(QMainWindow):
         version = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
         name = self.download_name_edit.text().strip() or version
         directory = Path(self.download_dir_edit.text().strip() or str(GAME_DIR)).expanduser()
+        layout = resolve_layout(directory, self.settings.default_layout)[0]
 
         self._install_version = version
-        self._pending_download = (name, directory)
+        self._pending_download = (name, layout)
         self._pending_loader = self.download_loader_combo.currentData() or None
         self._set_install_running(True)
-        self.download_status.setText(f"正在安装 {version} 到 {directory}…")
+        self.download_status.setText(f"正在安装 {version} 到 {layout.directory}…")
         self.download_progress.setRange(0, 0)
         self._refresh_process_panel()
 
         worker = InstallWorker(
-            version, directory, self.settings.default_java, self.settings.java_paths
+            version, layout, self.settings.default_java, self.settings.java_paths
         )
         worker.status_changed.connect(self._install_status)
         worker.progress_changed.connect(self._install_progress)
@@ -1983,11 +2135,11 @@ class MainWindow(QMainWindow):
     def _run_loader_after_install(
         self, loader_id: str, mc_version: str, pending, result
     ) -> None:
-        name, directory = pending
+        name, layout = pending
         label = loaders.LOADER_LABELS.get(loader_id, loader_id)
         self.download_status.setText(f"原版已安装，正在安装 {label}…")
         self.download_progress.setRange(0, 0)
-        worker = LoaderInstallWorker(loader_id, mc_version, directory)
+        worker = LoaderInstallWorker(loader_id, mc_version, layout)
         worker.status_changed.connect(self._install_status)
         worker.progress_changed.connect(self._install_progress)
         worker.failed.connect(self._install_failed)
@@ -2009,8 +2161,8 @@ class MainWindow(QMainWindow):
     def _create_instance_after_install(self, version_id: str, pending, result) -> None:
         instance = None
         if pending is not None:
-            name, directory = pending
-            instance = self.settings.add_instance(name, version_id, directory)
+            name, layout = pending
+            instance = self.settings.add_instance(name, version_id, str(layout.directory))
             self._persist()
 
         java_text = str(result.java_executable) if result.java_executable else "跳过（使用已有 Java）"
@@ -2227,6 +2379,17 @@ class MainWindow(QMainWindow):
         self.settings.min_memory = min_memory
         self.settings.show_log = self.show_log_check.isChecked()
         self.settings.instance_isolation = self.isolation_check.isChecked()
+        old_default_layout = self.settings.default_layout
+        self.settings.default_layout = (
+            self.default_layout_combo.currentData() or STYLE_PCL
+        )
+        if old_default_layout != self.settings.default_layout:
+            for entry in self.settings.game_dirs:
+                if entry.layout_source == "default":
+                    self.settings.refresh_layout(entry)
+            self._refresh_game_dir_widgets()
+            self._refresh_instance_list(select_id=self.settings.default_instance_id)
+            self._refresh_launch_info()
         self.settings.default_java = self.default_java_combo.currentData()
         self.settings.mirror = self.mirror_combo.currentData() or "mojang"
         self.settings.resource_source = self.resource_source_combo.currentData() or "modrinth"
@@ -2275,9 +2438,9 @@ class MainWindow(QMainWindow):
 
     def _resolve_game_root(self, instance: Instance) -> tuple[bool, Path]:
         """Apply the isolation priority and create the root when isolated."""
-        record = self.settings.game_dir_for_instance(instance)
-        isolated = self.settings.get_effective_isolation(record.id)
-        root = self.settings.effective_game_root(instance)
+        layout = self.settings.effective_layout(instance)
+        isolated = self.settings.isolation_for_instance(instance)
+        root = layout.game_root
         if isolated:
             root.mkdir(parents=True, exist_ok=True)
         return isolated, root
@@ -2306,7 +2469,7 @@ class MainWindow(QMainWindow):
         min_memory = instance.min_memory or self.settings.min_memory
         java_path = instance.java_path or self.settings.default_java
         extra_args = split_jvm_args(instance.jvm_args)
-        install_dir = Path(instance.game_dir).expanduser()
+        layout = self.settings.layout_for_instance(instance)
 
         # Isolation: the install directory keeps versions/libraries/assets,
         # only the actual --gameDir moves into instances/<name>/.
@@ -2323,7 +2486,7 @@ class MainWindow(QMainWindow):
         worker = LaunchWorker(
             instance.version,
             username,
-            install_dir,
+            layout,
             java_path,
             max_memory,
             min_memory,

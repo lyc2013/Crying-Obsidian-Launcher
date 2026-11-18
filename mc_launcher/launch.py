@@ -17,6 +17,7 @@ from . import __version__
 from .auth import OfflineAccount, offline_account
 from .config import GAME_DIR
 from .java import JavaError, JavaInstallation, inspect_java, resolve_java
+from .layout import Layout
 from .version import load_version_json
 
 
@@ -75,7 +76,7 @@ def _logging_options(game_dir: Path, version_data: dict) -> dict[str, object]:
 def build_launch_spec(
     version: str,
     username: str,
-    game_dir: Path | str | None = None,
+    layout: Layout | None = None,
     java_path: Path | str | None = None,
     memory_mb: int = 2048,
     min_memory_mb: int = 0,
@@ -87,19 +88,21 @@ def build_launch_spec(
 ) -> LaunchSpec:
     """Validate everything and return the full command without running it.
 
-    game_dir is where versions/libraries/assets live. game_root is the actual
-    --gameDir passed to Minecraft (used for instance isolation); it defaults to
-    game_dir. java_candidates are extra Java paths added by the user, used when
-    no explicit Java is selected and no bundled runtime is available.
+    layout owns every path (versions/libraries/assets/runtime). game_root is
+    the actual --gameDir passed to Minecraft (used for instance isolation); it
+    defaults to layout.game_root. java_candidates are extra Java paths added by
+    the user, used when no explicit Java is selected and no bundled runtime is
+    available.
     """
-    target = Path(game_dir).expanduser() if game_dir else GAME_DIR
-    root = Path(game_root).expanduser() if game_root else target
+    layout = layout or Layout(GAME_DIR)
+    target = layout.install_view()
+    root = Path(game_root).expanduser() if game_root else layout.game_root
     account = offline_account(username)
 
     try:
         # Modded versions (Forge/Fabric/modpacks) only exist on disk, so their
         # JSON has to be read locally instead of from Mojang's manifest.
-        version_data = load_version_json(version, target)
+        version_data = load_version_json(version, layout)
     except Exception as exc:
         raise LaunchError(f"Could not read metadata for {version}: {exc}") from exc
 
@@ -110,7 +113,7 @@ def build_launch_spec(
         java = resolve_java(required_major=required_major, manual_path=java_path)
     else:
         java = None
-        bundled = bundled_java(target, version_data)
+        bundled = bundled_java(layout.runtime_dir.parent, version_data)
         if bundled is not None and (
             not isinstance(required_major, int) or bundled.major >= required_major
         ):
@@ -126,7 +129,7 @@ def build_launch_spec(
         "launcherVersion": __version__,
         "jvmArguments": _jvm_arguments(memory_mb, min_memory_mb, extra_jvm_args),
     }
-    options.update(_logging_options(target, version_data))
+    options.update(_logging_options(layout.assets_dir, version_data))
     if server:
         options["server"] = server
         if port:

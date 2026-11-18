@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from minecraft_launcher_lib.mod_loader import get_mod_loader
+
+from .layout import Layout
 
 LOADERS = (
     ("forge", "Forge"),
@@ -66,10 +67,10 @@ def latest_loader_version(loader_id: str, mc_version: str) -> str | None:
     return _cached(("latest", loader_id, mc_version), produce)
 
 
-def installed_loader_version(loader_id: str, mc_version: str, game_dir) -> str | None:
+def installed_loader_version(loader_id: str, mc_version: str, layout: Layout) -> str | None:
     try:
         loader = get_mod_loader(loader_id)
-        return loader.get_installed_version(mc_version, str(game_dir))
+        return loader.get_installed_version(mc_version, str(layout.install_view()))
     except Exception:
         return None
 
@@ -77,7 +78,7 @@ def installed_loader_version(loader_id: str, mc_version: str, game_dir) -> str |
 def install_loader(
     loader_id: str,
     mc_version: str,
-    game_dir,
+    layout: Layout,
     loader_version: str | None = None,
     callback: dict | None = None,
     cancel=None,
@@ -112,7 +113,7 @@ def install_loader(
     try:
         return loader.install(
             mc_version,
-            str(Path(game_dir)),
+            str(layout.install_view()),
             loader_version=loader_version,
             callback=wrapped,
         )

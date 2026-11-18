@@ -11,8 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from .config import APP_DIR
+from .layout import (
+    STYLE_PCL,
+    Layout,
+    LayoutInfo,
+    resolve_layout,
+    set_style,
+)
 
 SETTINGS_PATH = APP_DIR / "settings.json"
+LAYOUTS = ("pcl", "multimc")
 
 DEFAULT_MAX_MEMORY = 2048
 DEFAULT_MIN_MEMORY = 512
@@ -32,6 +40,12 @@ class GameDirectory:
     path: str
     isolation_override: str = ISOLATION_GLOBAL
     isolation_detected: bool = False
+    # Layout fields are resolved from <path>/.launcher_profile on load and are
+    # not written to settings.json: the marker is the single source of truth.
+    layout_style: str = STYLE_PCL
+    layout_source: str = "default"
+    layout_recognized: bool = False
+    layout_direct: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +129,7 @@ class Settings:
     java_paths: list[str] = field(default_factory=list)
     default_java: str | None = None
     mirror: str = "bmclapi"
+    default_layout: str = STYLE_PCL
     max_memory: int = DEFAULT_MAX_MEMORY
     min_memory: int = DEFAULT_MIN_MEMORY
     show_log: bool = False
@@ -138,6 +153,7 @@ class Settings:
             "java_paths": self.java_paths,
             "default_java": self.default_java,
             "mirror": self.mirror,
+            "default_layout": self.default_layout,
             "max_memory": self.max_memory,
             "min_memory": self.min_memory,
             "show_log": self.show_log,
@@ -187,6 +203,11 @@ class Settings:
             java_paths=[str(path) for path in data.get("java_paths", []) if str(path).strip()],
             default_java=str(data["default_java"]) if data.get("default_java") else None,
             mirror=mirror,
+            default_layout=(
+                str(data.get("default_layout") or STYLE_PCL).lower()
+                if str(data.get("default_layout") or STYLE_PCL).lower() in LAYOUTS
+                else STYLE_PCL
+            ),
             max_memory=int_or(DEFAULT_MAX_MEMORY, "max_memory"),
             min_memory=int_or(DEFAULT_MIN_MEMORY, "min_memory"),
             show_log=bool(data.get("show_log", False)),
@@ -225,9 +246,21 @@ class Settings:
         # Directories saved before isolation detection existed follow the disk
         # layout once, then keep whatever the user chooses afterwards.
         for entry in self.game_dirs:
+            self.refresh_layout(entry)
             if not entry.isolation_detected:
-                entry.isolation_override = detect_isolation_override(entry.path)
+                entry.isolation_override = detect_isolation_override(
+                    entry.path, self.default_layout
+                )
                 entry.isolation_detected = True
+
+    def refresh_layout(self, entry: GameDirectory) -> LayoutInfo:
+        """Re-read the marker (or detect once) and cache the result on the entry."""
+        layout, info = resolve_layout(entry.path, self.default_layout)
+        entry.layout_style = layout.style
+        entry.layout_source = info.source
+        entry.layout_recognized = info.recognized
+        entry.layout_direct = layout.direct
+        return info
 
     def register_game_dir(self, path: str | os.PathLike[str]) -> GameDirectory:
         existing = self.find_game_dir(path)
@@ -237,11 +270,36 @@ class Settings:
         directory = GameDirectory(
             id=uuid.uuid4().hex[:8],
             path=str(path),
-            isolation_override=detect_isolation_override(path),
+            isolation_override=detect_isolation_override(path, self.default_layout),
             isolation_detected=True,
         )
         self.game_dirs.append(directory)
+        self.refresh_layout(directory)
         return directory
+
+    def layout_for_entry(self, entry: GameDirectory) -> Layout:
+        return Layout(
+            entry.path,
+            entry.layout_style,
+            direct=entry.layout_direct,
+        )
+
+    def layout_for_instance(self, instance: Instance) -> Layout:
+        return self.layout_for_entry(self.game_dir_for_instance(instance))
+
+    def effective_layout(self, instance: Instance) -> Layout:
+        """Layout whose ``game_root`` is the per-instance isolated folder."""
+        base = self.layout_for_instance(instance)
+        if not self.isolation_for_instance(instance):
+            return base
+        folder = _sanitize_folder_name(instance.name) or instance.id
+        return base.with_game_root(base.instances_root / folder)
+
+    def set_directory_layout(self, entry: GameDirectory, style: str) -> LayoutInfo:
+        """Manually lock a directory's layout; game files are never moved."""
+        info = set_style(entry.path, style)
+        self.refresh_layout(entry)
+        return info
 
     def find_game_dir(self, path: str | os.PathLike[str]) -> GameDirectory | None:
         key = _path_key(path)
@@ -298,12 +356,7 @@ class Settings:
 
     def effective_game_root(self, instance: Instance) -> Path:
         """The directory Minecraft should use as its root for this launch."""
-        base = Path(instance.game_dir).expanduser()
-        if not self.isolation_for_instance(instance):
-            return base
-
-        folder = _sanitize_folder_name(instance.name) or instance.id
-        return base / "instances" / folder
+        return self.effective_layout(instance).game_root
 
     def resolve_defaults(self) -> None:
         """Keep default ids/names pointing at things that still exist."""
@@ -353,14 +406,16 @@ def _path_key(path: str | os.PathLike[str]) -> str:
     return os.path.normcase(str(resolved))
 
 
-def detect_isolation_override(game_dir: str | os.PathLike[str]) -> str:
+def detect_isolation_override(
+    game_dir: str | os.PathLike[str], default_layout: str = STYLE_PCL
+) -> str:
     """Follow how the directory is already used on disk.
 
     A directory that already contains an `instances/` folder is treated as
     isolated, any other directory stays shared so existing mods/saves keep working.
     """
-    root = Path(game_dir).expanduser()
-    return ISOLATION_FORCE_ON if (root / "instances").is_dir() else ISOLATION_FORCE_OFF
+    root = Layout(game_dir, default_layout).instances_root
+    return ISOLATION_FORCE_ON if root.is_dir() else ISOLATION_FORCE_OFF
 
 
 def _sanitize_folder_name(name: str) -> str:

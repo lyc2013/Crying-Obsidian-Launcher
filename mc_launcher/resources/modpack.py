@@ -11,6 +11,7 @@ from pathlib import Path
 from minecraft_launcher_lib import install as mc_install
 from minecraft_launcher_lib import mrpack
 
+from ..layout import Layout
 from .download import DownloadError, download_file
 from .http import ApiClient, CancelToken, RequestCancelled
 from .providers import CurseForgeProvider, ResourceProvider
@@ -143,8 +144,7 @@ def extract_overrides(archive_path: Path, destination: Path) -> int:
 
 def install_mrpack(
     archive_path: Path,
-    minecraft_dir: Path,
-    modpack_dir: Path,
+    layout: Layout,
     callback: dict | None = None,
     cancel=None,
 ) -> dict:
@@ -169,11 +169,12 @@ def install_mrpack(
         if callback and callback.get("setMax"):
             callback["setMax"](value)
 
+    modpack_dir = layout.game_root
     modpack_dir.mkdir(parents=True, exist_ok=True)
     try:
         mrpack.install_mrpack(
             str(archive_path),
-            str(minecraft_dir),
+            str(layout.install_view()),
             str(modpack_dir),
             callback={"setStatus": status, "setProgress": progress, "setMax": maximum},
         )
@@ -194,8 +195,7 @@ def install_mrpack(
 
 def install_curseforge_pack(
     archive_path: Path,
-    minecraft_dir: Path,
-    modpack_dir: Path,
+    layout: Layout,
     provider: ResourceProvider,
     client: ApiClient,
     callback: dict | None = None,
@@ -205,6 +205,9 @@ def install_curseforge_pack(
     info = inspect_modpack(archive_path)
     if info["kind"] != "curseforge":
         raise ModpackError("该整合包不是 CurseForge 格式")
+
+    minecraft_dir = layout.install_view()
+    modpack_dir = layout.game_root
 
     manifest = _read_json_from_zip(Path(archive_path), "manifest.json") or {}
     minecraft = manifest.get("minecraft") or {}
@@ -248,7 +251,7 @@ def install_curseforge_pack(
         install_loader(
             info["loader_id"],
             mc_version,
-            minecraft_dir,
+            layout,
             loader_version=info["loader_version"],
             callback=callback,
             cancel=cancel,
@@ -259,7 +262,7 @@ def install_curseforge_pack(
     extract_overrides(Path(archive_path), modpack_dir)
 
     files = [entry for entry in manifest.get("files") or [] if isinstance(entry, dict)]
-    mods_dir = modpack_dir / "mods"
+    mods_dir = layout.mods_dir
     mods_dir.mkdir(parents=True, exist_ok=True)
     if callback and callback.get("setMax"):
         callback["setMax"](max(1, len(files)))
@@ -290,15 +293,14 @@ def install_curseforge_pack(
         from ..loaders import installed_loader_version
 
         info["launch_version"] = (
-            installed_loader_version(info["loader_id"], mc_version, minecraft_dir) or ""
+            installed_loader_version(info["loader_id"], mc_version, layout) or ""
         )
     return info
 
 
 def install_archive(
     archive_path: Path,
-    minecraft_dir: Path,
-    modpack_dir: Path,
+    layout: Layout,
     provider: ResourceProvider,
     client: ApiClient,
     callback: dict | None = None,
@@ -306,9 +308,9 @@ def install_archive(
 ) -> dict:
     info = inspect_modpack(archive_path)
     if info["kind"] == "mrpack":
-        return install_mrpack(archive_path, minecraft_dir, modpack_dir, callback, cancel)
+        return install_mrpack(archive_path, layout, callback, cancel)
     return install_curseforge_pack(
-        archive_path, minecraft_dir, modpack_dir, provider, client, callback, cancel
+        archive_path, layout, provider, client, callback, cancel
     )
 
 

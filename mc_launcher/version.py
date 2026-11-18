@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -24,6 +23,7 @@ from .config import (
     ensure_app_dirs,
 )
 from .mirror import mirror_name
+from .layout import Layout
 
 logger = logging.getLogger(__name__)
 
@@ -192,10 +192,10 @@ def fetch_version_json(version_id: str, refresh: bool = False) -> dict[str, Any]
 
 
 def local_version_json(
-    version_id: str, game_dir: str | Path
+    version_id: str, layout: Layout
 ) -> dict[str, Any] | None:
     """Read the version JSON that is already installed in a game directory."""
-    path = Path(game_dir).expanduser() / "versions" / version_id / f"{version_id}.json"
+    path = layout.version_json(version_id)
     if not path.is_file():
         return None
     try:
@@ -205,14 +205,14 @@ def local_version_json(
     return data if isinstance(data, dict) else None
 
 
-def inheritance_chain(version_id: str, game_dir: str | Path) -> list[dict[str, Any]]:
+def inheritance_chain(version_id: str, layout: Layout) -> list[dict[str, Any]]:
     """Return local version JSONs, the requested one first, then its parents."""
     chain: list[dict[str, Any]] = []
     seen: set[str] = set()
     current: str | None = version_id
     while current and current not in seen:
         seen.add(current)
-        node = local_version_json(current, game_dir)
+        node = local_version_json(current, layout)
         if node is None:
             break
         chain.append(node)
@@ -221,14 +221,14 @@ def inheritance_chain(version_id: str, game_dir: str | Path) -> list[dict[str, A
     return chain
 
 
-def resolve_version_data(version_id: str, game_dir: str | Path) -> dict[str, Any]:
+def resolve_version_data(version_id: str, layout: Layout) -> dict[str, Any]:
     """Merge a local version chain so javaVersion/logging resolve like the game.
 
     Modded installs (Forge/Fabric/modpacks) usually only store a small child
     JSON and inherit everything else, so Java and logging settings have to be
     looked up in the parent vanilla JSON.
     """
-    chain = inheritance_chain(version_id, game_dir)
+    chain = inheritance_chain(version_id, layout)
     merged: dict[str, Any] = {}
     libraries: list[dict[str, Any]] = []
     seen_libraries: set[str] = set()
@@ -250,11 +250,11 @@ def resolve_version_data(version_id: str, game_dir: str | Path) -> dict[str, Any
 
 
 def load_version_json(
-    version_id: str, game_dir: str | Path | None = None, refresh: bool = False
+    version_id: str, layout: Layout | None = None, refresh: bool = False
 ) -> dict[str, Any]:
     """Prefer the installed version JSON, fall back to Mojang metadata."""
-    if game_dir is not None:
-        local = resolve_version_data(version_id, game_dir)
+    if layout is not None:
+        local = resolve_version_data(version_id, layout)
         if local:
             return local
     return fetch_version_json(version_id, refresh=refresh)
@@ -418,9 +418,9 @@ def _save_category_meta() -> None:
     )
 
 
-def scan_local_versions(game_dir: str | Path) -> list[dict[str, Any]]:
-    """扫描 <game_dir>/versions，读取每个版本的 version.json 元数据。"""
-    versions_dir = Path(game_dir).expanduser() / "versions"
+def scan_local_versions(layout: Layout) -> list[dict[str, Any]]:
+    """扫描 Layout 的 versions 目录，读取每个版本的 version.json 元数据。"""
+    versions_dir = layout.versions_dir
     result: list[dict[str, Any]] = []
     if not versions_dir.is_dir():
         return result
@@ -471,16 +471,16 @@ def _legacy_category(manifest_type: str | None, version_id: str) -> str:
     return CATEGORY_APRIL_FOOLS
 
 
-def repair(game_dir: str | Path | None = None) -> dict[str, Any]:
+def repair(layout: Layout | None = None) -> dict[str, Any]:
     """重新分类本地版本，写回分类元数据，并返回错分清单。
 
     只修改 meta/version_categories.json，不会删除版本或重新下载文件。
     """
-    directory = Path(game_dir).expanduser() if game_dir is not None else GAME_DIR
+    directory = layout or Layout(GAME_DIR)
     local_versions = scan_local_versions(directory)
     if not local_versions:
         return {
-            "game_dir": str(directory),
+            "game_dir": str(directory.directory),
             "scanned": 0,
             "fixed": 0,
             "updated": 0,
@@ -529,7 +529,7 @@ def repair(game_dir: str | Path | None = None) -> dict[str, Any]:
     meta.update(computed)
     _save_category_meta()
     return {
-        "game_dir": str(directory),
+        "game_dir": str(directory.directory),
         "scanned": len(computed),
         "fixed": len(rows),
         "updated": updated,
@@ -539,14 +539,14 @@ def repair(game_dir: str | Path | None = None) -> dict[str, Any]:
 
 
 def version_category_for(
-    version_id: str, game_dir: str | Path, manifest: dict[str, dict[str, Any]] | None = None
+    version_id: str, layout: Layout, manifest: dict[str, dict[str, Any]] | None = None
 ) -> str:
     """Return the stored/derived category for a version in a game directory."""
     cached = _category_meta().get(version_id)
     if cached and cached != CATEGORY_UNKNOWN:
         return cached
 
-    local = local_version_json(version_id, game_dir)
+    local = local_version_json(version_id, layout)
     local_type = local.get("type") if isinstance(local, dict) else None
     if manifest is None:
         try:
@@ -562,27 +562,27 @@ def version_category_for(
     return category
 
 
-def base_version_id(version_id: str, game_dir: str | Path) -> str | None:
+def base_version_id(version_id: str, layout: Layout) -> str | None:
     """Return the vanilla base version id of an installed (possibly modded) version."""
-    chain = inheritance_chain(version_id, game_dir)
+    chain = inheritance_chain(version_id, layout)
     if not chain:
         return None
     return chain[-1].get("id")
 
 
-def instance_category_label(version_id: str, game_dir: str | Path) -> str:
+def instance_category_label(version_id: str, layout: Layout) -> str:
     """Return the category label for an installed instance, based on its base version."""
-    base = base_version_id(version_id, game_dir)
+    base = base_version_id(version_id, layout)
     if base is None:
         return "未知"
-    category = version_category_for(base, game_dir)
+    category = version_category_for(base, layout)
     return CATEGORY_LABELS.get(category, "未知")
 
 
-def instance_version_info(version_id: str, game_dir: str | Path) -> tuple[str, str]:
+def instance_version_info(version_id: str, layout: Layout) -> tuple[str, str]:
     """Return (base_version_id, category_label) for an installed instance."""
-    base = base_version_id(version_id, game_dir) or version_id
-    category = instance_category_label(version_id, game_dir)
+    base = base_version_id(version_id, layout) or version_id
+    category = instance_category_label(version_id, layout)
     return base, category
 
 
@@ -596,9 +596,9 @@ _LOADER_LIBRARIES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def detect_mod_loader(version_id: str, game_dir: str | Path) -> tuple[str, str | None]:
+def detect_mod_loader(version_id: str, layout: Layout) -> tuple[str, str | None]:
     """Return (loader name, loader version) for an installed version."""
-    chain = inheritance_chain(version_id, game_dir)
+    chain = inheritance_chain(version_id, layout)
     library_names: list[str] = []
     for node in chain:
         for library in node.get("libraries") or []:
@@ -626,8 +626,8 @@ def detect_mod_loader(version_id: str, game_dir: str | Path) -> tuple[str, str |
     return "原版", None
 
 
-def loader_label(version_id: str, game_dir: str | Path) -> str:
-    loader, loader_version = detect_mod_loader(version_id, game_dir)
+def loader_label(version_id: str, layout: Layout) -> str:
+    loader, loader_version = detect_mod_loader(version_id, layout)
     return f"{loader} {loader_version}" if loader_version else loader
 
 

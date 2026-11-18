@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import GAME_DIR
+from ..layout import Layout
 from ..settings import save_settings
 from . import cache, mapper, modpack
 from .download import download_file, unique_target
@@ -222,9 +223,9 @@ class ResourcePage(QWidget):
 
         selected = 0
         for position, instance in enumerate(settings.instances[:20], start=1):
-            game_dir = settings.effective_game_root(instance)
-            base, _category = instance_version_info(instance.version, game_dir)
-            label = loader_label(instance.version, game_dir)
+            layout = settings.layout_for_instance(instance)
+            base, _category = instance_version_info(instance.version, layout)
+            label = loader_label(instance.version, layout)
             key = mapper.normalize_loader(label)
             target = (base, key) if base and base != "—" else None
             self.target_combo.addItem(
@@ -588,25 +589,26 @@ class ResourcePage(QWidget):
             self._dependency_banner = None
 
     # --------------------------------------------------------------- downloads
-    def _base_dir(self) -> Path:
+    def _base_layout(self) -> Layout:
         settings = self.get_settings()
         if settings.resource_download_dir:
-            return Path(settings.resource_download_dir).expanduser()
+            return Layout(settings.resource_download_dir, settings.default_layout)
         instance = settings.default_instance()
         if instance is not None:
-            return settings.effective_game_root(instance)
-        return Path(GAME_DIR).expanduser()
+            return settings.effective_layout(instance)
+        return Layout(GAME_DIR, settings.default_layout)
 
     def resource_dir(self, kind: str) -> Path | None:
-        base = self._base_dir()
+        layout = self._base_layout()
         return {
-            "mod": base / "mods",
-            "resourcepack": base / "resourcepacks",
-            "shader": base / "shaderpacks",
+            "mod": layout.mods_dir,
+            "resourcepack": layout.resourcepacks_dir,
+            "shader": layout.shaderpacks_dir,
         }.get(kind)
 
     def _pick_save(self) -> Path | None:
-        saves = self._base_dir() / "saves"
+        layout = self._base_layout()
+        saves = layout.saves_dir
         names = []
         try:
             names = sorted(entry.name for entry in saves.iterdir() if entry.is_dir())
@@ -622,7 +624,7 @@ class ResourcePage(QWidget):
         )
         if not ok or not chosen:
             return None
-        return saves / chosen / "datapacks"
+        return layout.datapacks_dir(chosen)
 
     def start_download(self, version: ResourceVersion, item: ResourceItem) -> None:
         file = version.primary_file()
@@ -694,8 +696,8 @@ class ResourcePage(QWidget):
             QMessageBox.information(self, "整合包", "已有整合包正在安装，请稍候。")
             return
         self._modpack_running = True
-        base = self._base_dir()
-        base.mkdir(parents=True, exist_ok=True)
+        base = self._base_layout()
+        base.directory.mkdir(parents=True, exist_ok=True)
 
         def task(token, progress, status):
             status("正在下载整合包…")
@@ -704,8 +706,9 @@ class ResourcePage(QWidget):
             )
             info = modpack.inspect_modpack(archive)
             name = self._unique_instance_name(str(info.get("name") or item.title))
-            root = base / "instances" / _folder_name(name)
+            root = base.instances_root / _folder_name(name)
             root.mkdir(parents=True, exist_ok=True)
+            instance_layout = base.with_game_root(root)
             status("正在安装整合包…")
             state = {"max": 0}
 
@@ -722,8 +725,7 @@ class ResourcePage(QWidget):
             }
             result = modpack.install_archive(
                 archive,
-                base,
-                root,
+                instance_layout,
                 self.provider,
                 self.provider.client,
                 callback=callback,
@@ -745,7 +747,7 @@ class ResourcePage(QWidget):
         worker.cancelled.connect(reset_flag)
         worker.finished.connect(lambda: self._apply_modpack_result(worker, base, item))
 
-    def _apply_modpack_result(self, worker: DownloadWorker, base: Path, item: ResourceItem) -> None:
+    def _apply_modpack_result(self, worker: DownloadWorker, base: Layout, item: ResourceItem) -> None:
         result = worker.result if isinstance(worker.result, dict) else None
         self._workers.discard(worker)
         self._modpack_running = False
@@ -756,7 +758,7 @@ class ResourcePage(QWidget):
             instance = settings.add_instance(
                 result.get("name") or item.title,
                 result.get("version") or result.get("mc_version") or "",
-                str(base),
+                str(base.directory),
             )
             save_settings(settings)
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI

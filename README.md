@@ -15,7 +15,6 @@
 - 自动检测本机 Java，也可手动添加任意 Java 路径；版本需要的 Java 版本不满足时会提示
 - 拼接并执行启动命令，实时显示游戏日志
 - 多游戏目录管理：一个游戏目录下可以有多个实例
-- 支持 PCL / MultiMC 两种目录结构，自动识别、可手动指定，切换不移动已有文件
 - 实例隔离：每个实例使用独立游戏根目录（mods/config/saves 互不影响）
 - 自动识别实例使用的加载器（Forge / NeoForge / Fabric / Quilt / LiteLoader / OptiFine / 原版）
 - 一键安装 Forge / NeoForge / Fabric / Quilt 加载器，可切换加载器版本
@@ -98,9 +97,9 @@ python -m mc_launcher gui                   # 打开图形界面
 | 版本管理 | 左侧按游戏目录分组显示实例（显示实际版本、分类、加载器）；右侧编辑名称、版本、加载器、实际版本、分类、Java、内存、附加参数、隔离方式；支持设为默认、启动此实例、删除 |
 | 下载 | 「原版游戏」按正式版/预览版/远古版/愚人节版分类列出版本，预览版内可再筛选快照/预发布/候选；可选择加载器只看该加载器支持的版本；「资源下载」分模组/整合包/光影/资源包/数据包五个标签，搜索、分页/滚动加载、详情下钻与下载队列 |
 | 账号管理 | 添加/删除多个离线账号，设置默认账号 |
-| 设置 | Java 列表与手动添加、镜像源切换、全局内存、实例隔离开关、默认目录结构、日志显示开关、资源下载源 / CurseForge API Key / 并发数 / 分页模式 / 中文简介 / 下载目录 / 代理 |
+| 设置 | Java 列表与手动添加、镜像源切换、全局内存、实例隔离开关、日志显示开关、资源下载源 / CurseForge API Key / 并发数 / 分页模式 / 中文简介 / 下载目录 / 代理 |
 
-添加游戏目录时，启动器会按识别出的目录结构扫描版本并自动创建实例，只写启动器配置，不修改游戏文件。
+添加游戏目录时，启动器会扫描该目录 `versions/` 下的所有版本并自动创建实例，只写启动器配置，不修改游戏文件。
 
 ## 资源下载
 
@@ -142,46 +141,12 @@ python -m mc_launcher gui                   # 打开图形界面
 
 切换隔离方式不会迁移已有的 mods / saves，只影响后续启动。
 
-## 目录结构（PCL / MultiMC）
-
-一个「游戏目录」指存放多个版本的根目录。启动器支持两种风格，路径规则如下：
-
-| 内容 | PCL | MultiMC |
-| --- | --- | --- |
-| 客户端目录 | `<目录>/.minecraft` | `<目录>/.minecraft`（也接受 `minecraft`） |
-| 版本（versions） | `<目录>/.minecraft/versions/` | `<目录>/.minecraft/versions/` |
-| libraries | `<目录>/.minecraft/libraries/` | `<目录>/libraries/` |
-| assets | `<目录>/.minecraft/assets/` | `<目录>/assets/` |
-| runtime | `<目录>/.minecraft/runtime/` | `<目录>/runtime/` |
-| mods / resourcepacks / shaderpacks / saves | `<客户端目录>/…` | `<客户端目录>/…` |
-
-- 默认风格为 **PCL**，可在「设置 → 默认目录结构」修改。全局默认只影响新建目录和尚未识别的已有目录。
-- 每个游戏目录可在设置页单独指定风格，优先级高于全局默认。
-- 直接选择 `.minecraft` 这类客户端根目录时，按旧式目录处理，固定使用 PCL 风格。
-
-### 自动识别
-
-添加目录时按以下顺序判断，命中即停：
-
-1. 目录里有 `instance.cfg` → MultiMC
-2. `.minecraft/versions/<名称>/<名称>.jar` 存在，且 `.minecraft/libraries`、`.minecraft/assets` 都存在 → PCL
-3. `.minecraft` 存在，`<目录>/libraries` 存在但 `.minecraft/libraries` 不存在 → MultiMC
-4. 都判断不了 → 使用全局默认风格，界面标注「未识别，按默认处理，可手动指定」
-
-识别结果记录在目录下的 `.launcher_profile`（JSON：`{"profile":"pcl"|"multimc","version":1,"locked":...}`）。
-自动识别写入的标记不锁定；手动指定会锁定，之后自动识别不再覆盖。
-
-切换风格只做三件事：写入标记、重新解析并刷新版本列表、提示「已有文件不会被自动移动」。**启动器不会移动、复制或重命名任何游戏文件。**
-
-MultiMC 风格的 libraries/assets 位于客户端目录之外，而底层库只接受单一游戏目录。为此启动器会在自己的缓存目录建立目录链接（Windows 使用 junction），把 `versions`、`libraries`、`assets`、`runtime` 映射到实际位置，用户目录保持原样。Windows 上创建 junction 通常不需要管理员权限；若失败会给出明确提示。
-
 ## 数据位置
 
 | 内容 | 路径 |
 | --- | --- |
 | 启动器配置（实例、账号、设置） | `~/.mc-launcher/settings.json` |
 | 版本元数据缓存 | `~/.mc-launcher/meta/` |
-| MultiMC 目录结构视图 | `~/.mc-launcher/layout_views/`（只含指向实际目录的链接） |
 | 游戏目录 | 默认取官方启动器的 `.minecraft` 路径，也可在界面里自行添加 |
 
 Windows 上 `~` 是 `C:\Users\<用户名>`。
@@ -212,7 +177,6 @@ mc_launcher/
 ├── java.py        # 本机 Java 检测与版本选择
 ├── launch.py      # 启动命令构建与子进程运行
 ├── settings.py    # 启动器配置、游戏目录、实例、隔离规则
-├── layout.py      # PCL / MultiMC 目录结构、识别、标记文件、安装视图链接
 ├── loaders.py     # Forge/NeoForge/Fabric/Quilt 版本查询与安装（可取消）
 ├── resources/     # 资源下载模块（接口层与 UI 分离）
 │   ├── models.py      # ResourceItem / ResourceVersion / ResourceFile 统一模型

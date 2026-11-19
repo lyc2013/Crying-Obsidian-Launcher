@@ -16,9 +16,8 @@ from minecraft_launcher_lib import runtime
 from minecraft_launcher_lib.exceptions import VersionNotFound
 
 from .config import GAME_DIR
-from .layout import Layout
 from .java import JavaError, resolve_java
-from .mirror import DownloadAborted, downloads_aborted, enable_mirror, reset_downloads
+from .mirror import DownloadAborted, enable_mirror, reset_downloads
 from .version import fetch_version_json
 
 
@@ -188,7 +187,7 @@ def _maybe_skip_jvm(
 
 def install_version(
     version_id: str,
-    layout: Layout | None = None,
+    game_dir: Path | None = None,
     printer: ProgressPrinter | None = None,
     install_java: bool | None = None,
     java_path: Path | str | None = None,
@@ -202,8 +201,7 @@ def install_version(
     """
     enable_mirror()
     reset_downloads()
-    layout = layout or Layout(GAME_DIR)
-    target = layout.install_view()
+    target = Path(game_dir).expanduser() if game_dir else GAME_DIR
     progress = printer or ProgressPrinter()
 
     # Fetching our metadata first gives a clear error before the long download
@@ -229,13 +227,13 @@ def install_version(
     # Verify against the installed version JSON, not the pre-fetched metadata:
     # a mirror may serve slightly different content, and the game directory is
     # the source of truth for what was actually downloaded.
-    installed_json = layout.version_json(version_id)
+    installed_json = target / "versions" / version_id / f"{version_id}.json"
     if not installed_json.is_file():
         raise InstallError(f"Version JSON was not created: {installed_json}")
     installed_data = json.loads(installed_json.read_text(encoding="utf-8"))
 
     client = installed_data.get("downloads", {}).get("client", {})
-    client_jar = layout.version_jar(version_id)
+    client_jar = target / "versions" / version_id / f"{version_id}.jar"
     expected_sha1 = client.get("sha1")
 
     if not client_jar.is_file():
@@ -247,12 +245,12 @@ def install_version(
             f"client.jar SHA1 mismatch: expected {expected_sha1}, got {actual_sha1}"
         )
 
-    asset_index_id, asset_count = _verify_asset_index(layout, installed_data)
-    java_executable = _find_java_runtime(layout, installed_data)
+    asset_index_id, asset_count = _verify_asset_index(target, installed_data)
+    java_executable = _find_java_runtime(target, installed_data)
 
     return InstallResult(
         version=version_id,
-        game_dir=layout.game_root,
+        game_dir=target,
         client_jar=client_jar,
         client_sha1=actual_sha1,
         asset_index_id=asset_index_id,
@@ -261,14 +259,13 @@ def install_version(
     )
 
 
-def _verify_asset_index(layout: Layout, version_data: dict) -> tuple[str | None, int]:
+def _verify_asset_index(game_dir: Path, version_data: dict) -> tuple[str | None, int]:
     asset_index = version_data.get("assetIndex", {})
     index_id = asset_index.get("id")
     if not index_id:
         return None, 0
 
-    assets = layout.assets_dir
-    index_path = assets / "indexes" / f"{index_id}.json"
+    index_path = game_dir / "assets" / "indexes" / f"{index_id}.json"
     if not index_path.is_file():
         raise InstallError(f"Asset index was not created: {index_path}")
 
@@ -293,7 +290,7 @@ def _verify_asset_index(layout: Layout, version_data: dict) -> tuple[str | None,
     missing: list[str] = []
     wrong_size: list[str] = []
     for digest, size in unique_objects.items():
-        object_path = layout.assets_dir / "objects" / digest[:2] / digest
+        object_path = game_dir / "assets" / "objects" / digest[:2] / digest
         if not object_path.is_file():
             missing.append(digest)
         elif isinstance(size, int) and object_path.stat().st_size != size:
@@ -307,10 +304,10 @@ def _verify_asset_index(layout: Layout, version_data: dict) -> tuple[str | None,
     return index_id, len(objects)
 
 
-def _find_java_runtime(layout: Layout, version_data: dict) -> Path | None:
+def _find_java_runtime(game_dir: Path, version_data: dict) -> Path | None:
     component = version_data.get("javaVersion", {}).get("component")
     if not component:
         return None
 
-    java_path = runtime.get_executable_path(component, str(layout.runtime_dir.parent))
+    java_path = runtime.get_executable_path(component, str(game_dir))
     return Path(java_path) if java_path else None

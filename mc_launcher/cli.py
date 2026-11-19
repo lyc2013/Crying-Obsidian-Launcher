@@ -14,9 +14,7 @@ from .config import GAME_DIR, PROJECT_SLUG, VERSIONS_META_DIR
 from .install import InstallError, install_version
 from .java import JavaError, choose_java, detect_java, inspect_java
 from .launch import LaunchError, build_launch_spec, format_command, run_game
-from .layout import Layout, resolve_layout
 from .mirror import enable_mirror, mirror_name
-from .settings import load_settings
 from .version import (
     VersionError,
     fetch_version_summary,
@@ -80,18 +78,12 @@ def _cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
-def _layout_for(game_dir: Path | None) -> Layout:
-    style = load_settings().default_layout
-    layout, _info = resolve_layout(game_dir or GAME_DIR, style)
-    return layout
-
-
 def _cmd_install(args: argparse.Namespace) -> int:
-    layout = _layout_for(args.game_dir)
+    game_dir = args.game_dir.expanduser() if args.game_dir else None
     try:
         result = install_version(
             args.version,
-            layout=layout,
+            game_dir=game_dir,
             install_java=True if args.install_jre else None,
             java_path=args.java,
         )
@@ -116,8 +108,9 @@ def _cmd_install(args: argparse.Namespace) -> int:
 
 
 def _cmd_repair(args: argparse.Namespace) -> int:
+    game_dir = args.game_dir.expanduser() if args.game_dir else None
     try:
-        report = repair(_layout_for(args.game_dir))
+        report = repair(game_dir)
     except VersionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -198,7 +191,7 @@ def _cmd_launch(args: argparse.Namespace) -> int:
         spec = build_launch_spec(
             args.version,
             args.username,
-            layout=_layout_for(args.game_dir),
+            game_dir=args.game_dir,
             java_path=args.java,
             memory_mb=args.memory,
             extra_jvm_args=args.jvm_arg,

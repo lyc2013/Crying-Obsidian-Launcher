@@ -25,16 +25,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .layout import Layout
-
 DISABLED_SUFFIX = ".disabled"
 
-# (key, label)
+# (key, label, folder name; None means <saves>/<save>/datapacks)
 CATEGORIES = (
-    ("mod", "模组"),
-    ("resourcepack", "资源包"),
-    ("shader", "光影"),
-    ("datapack", "数据包"),
+    ("mod", "模组", "mods"),
+    ("resourcepack", "资源包", "resourcepacks"),
+    ("shader", "光影", "shaderpacks"),
+    ("datapack", "数据包", None),
 )
 
 
@@ -47,13 +45,27 @@ class ResourceEntry:
     modified: float
 
 
-def list_saves(saves_dir: Path) -> list[Path]:
+def category_directory(root: Path, category: str) -> Path | None:
+    for key, _label, folder in CATEGORIES:
+        if key == category:
+            return root / folder if folder else None
+    return None
+
+
+def list_saves(root: Path) -> list[Path]:
+    saves_dir = root / "saves"
     if not saves_dir.is_dir():
         return []
     return sorted(
         (entry for entry in saves_dir.iterdir() if entry.is_dir()),
         key=lambda entry: entry.name.lower(),
     )
+
+
+def datapack_directory(root: Path, save_name: str | None) -> Path | None:
+    if not save_name:
+        return None
+    return root / "saves" / save_name / "datapacks"
 
 
 def list_entries(directory: Path | None) -> list[ResourceEntry]:
@@ -148,10 +160,10 @@ def format_time(timestamp: float) -> str:
 class CategoryPage(QWidget):
     """One tab: table of resource files plus toggle/delete/import actions."""
 
-    def __init__(self, category: str, layout: Layout, parent=None) -> None:
+    def __init__(self, category: str, root: Path, parent=None) -> None:
         super().__init__(parent)
         self.category = category
-        self.layout = layout
+        self.root = Path(root)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
@@ -209,14 +221,8 @@ class CategoryPage(QWidget):
     def current_directory(self) -> Path | None:
         if self.category == "datapack":
             save = self.save_combo.currentData() if self.save_combo is not None else None
-            return self.layout.datapacks_dir(save) if save else None
-        if self.category == "mod":
-            return self.layout.mods_dir
-        if self.category == "resourcepack":
-            return self.layout.resourcepacks_dir
-        if self.category == "shader":
-            return self.layout.shaderpacks_dir
-        return None
+            return datapack_directory(self.root, save)
+        return category_directory(self.root, self.category)
 
     def _reload_saves(self) -> None:
         if self.save_combo is None:
@@ -224,7 +230,7 @@ class CategoryPage(QWidget):
         previous = self.save_combo.currentData()
         self.save_combo.blockSignals(True)
         self.save_combo.clear()
-        for save in list_saves(self.layout.saves_dir):
+        for save in list_saves(self.root):
             self.save_combo.addItem(save.name, save.name)
         if previous:
             index = self.save_combo.findData(previous)
@@ -350,30 +356,29 @@ class CategoryPage(QWidget):
 class ResourceManagerDialog(QDialog):
     """Resource management for one instance, one tab per resource type."""
 
-    def __init__(self, parent, instance, layout: Layout) -> None:
+    def __init__(self, parent, instance, game_root: Path) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"资源管理 · {instance.name}")
         self.resize(760, 520)
         self.instance = instance
-        self.layout = layout
+        self.game_root = Path(game_root)
 
-        layout_box = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
         self.summary = QLabel(
             f"实例「{instance.name}」 · 版本 {instance.version}"
-            f"\n游戏目录：{layout.game_root}"
-            f"\n目录结构：{layout.style.upper()}"
+            f"\n游戏目录：{self.game_root}"
         )
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet("color: palette(mid);")
-        layout_box.addWidget(self.summary)
+        layout.addWidget(self.summary)
 
         self.tabs = QTabWidget()
         self.pages: dict[str, CategoryPage] = {}
-        for key, label in CATEGORIES:
-            page = CategoryPage(key, layout)
+        for key, label, _folder in CATEGORIES:
+            page = CategoryPage(key, self.game_root)
             self.pages[key] = page
             self.tabs.addTab(page, label)
-        layout_box.addWidget(self.tabs, 1)
+        layout.addWidget(self.tabs, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -383,7 +388,7 @@ class ResourceManagerDialog(QDialog):
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.accept)
         buttons.addWidget(close_button)
-        layout_box.addLayout(buttons)
+        layout.addLayout(buttons)
 
         self.tabs.currentChanged.connect(self._tab_changed)
 
